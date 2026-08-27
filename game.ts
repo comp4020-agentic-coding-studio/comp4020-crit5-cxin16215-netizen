@@ -158,6 +158,12 @@ function farEnough(pos: Vec2, others: { pos: Vec2; radius: number }[], minGap: n
   return others.every((o) => dist(pos, o.pos) > o.radius + minGap);
 }
 
+function insideAnyWall(pos: Vec2, radius: number, walls: WallRect[]): boolean {
+  return walls.some(
+    (w) => pos.x + radius > w.x && pos.x - radius < w.x + w.w && pos.y + radius > w.y && pos.y - radius < w.y + w.h,
+  );
+}
+
 function placeAvoiding(
   width: number,
   height: number,
@@ -166,10 +172,11 @@ function placeAvoiding(
   minGap: number,
   attempts = 40,
   yRange?: YRange,
+  walls: WallRect[] = [],
 ): Vec2 {
   for (let i = 0; i < attempts; i++) {
     const p = randomPoint(width, height, radius + 10, yRange);
-    if (farEnough(p, avoid, minGap)) return p;
+    if (farEnough(p, avoid, minGap) && !insideAnyWall(p, radius, walls)) return p;
   }
   return randomPoint(width, height, radius + 10, yRange);
 }
@@ -419,7 +426,7 @@ function consumeFood(state: GameState): void {
   while (state.food.length < FOOD_COUNT) {
     const occupied = [{ pos: state.player.pos, radius: state.player.radius + 30 }];
     state.food.push({
-      pos: placeAvoiding(state.width, state.height, FOOD_RADIUS, occupied, 8, 40),
+      pos: placeAvoiding(state.width, state.height, FOOD_RADIUS, occupied, 8, 40, undefined, state.walls),
       radius: FOOD_RADIUS,
     });
   }
@@ -495,7 +502,7 @@ function stepPowerUps(state: GameState, dt: number): void {
     if (cooldown <= 0 && !state.powerUps.some((p) => p.kind === kind)) {
       const occupied = [{ pos: state.player.pos, radius: state.player.radius + 30 }];
       state.powerUps.push({
-        pos: placeAvoiding(state.width, state.height, POWERUP_RADIUS, occupied, 12, 40),
+        pos: placeAvoiding(state.width, state.height, POWERUP_RADIUS, occupied, 12, 40, undefined, state.walls),
         radius: POWERUP_RADIUS,
         kind,
       });
