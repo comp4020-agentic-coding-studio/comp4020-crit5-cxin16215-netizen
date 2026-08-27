@@ -25,3 +25,19 @@ canvas {
   white-space: nowrap;
   border: 0;
 }
+
+/* A keyboard user tabbing to the nav link needs it to actually become
+   visible on focus -- otherwise focus lands somewhere with no visible
+   indicator anywhere on the page. */
+.sr-only:focus-within {
+  position: static;
+  width: auto;
+  height: auto;
+  padding: 0.5em 1em;
+  margin: 0;
+  overflow: visible;
+  clip: auto;
+  white-space: normal;
+  background: #0e1420;
+  color: #f4fffb;
+}

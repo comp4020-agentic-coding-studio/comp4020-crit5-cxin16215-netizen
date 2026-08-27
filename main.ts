@@ -87,6 +87,41 @@ canvas.addEventListener("pointerdown", (e) => {
   target.y = state.player.pos.y;
 });
 
+// Keyboard is a full alternative to the pointer: arrow keys/WASD nudge the
+// same `target` the pointer drives, and Enter/Space restarts from the end
+// screen -- so play doesn't require a mouse, with no on-screen hint needed
+// (the keys either do something on the first try or they don't).
+const KEYBOARD_SPEED = 340;
+const MOVE_KEYS = new Set(["arrowup", "arrowdown", "arrowleft", "arrowright", "w", "a", "s", "d"]);
+const heldKeys = new Set<string>();
+
+window.addEventListener("keydown", (e) => {
+  const key = e.key.toLowerCase();
+  if (MOVE_KEYS.has(key)) {
+    heldKeys.add(key);
+    e.preventDefault();
+  } else if (state.status !== "playing" && (key === "enter" || key === " ")) {
+    e.preventDefault();
+    state = createInitialState(window.innerWidth, window.innerHeight);
+    target.x = state.player.pos.x;
+    target.y = state.player.pos.y;
+  }
+});
+window.addEventListener("keyup", (e) => heldKeys.delete(e.key.toLowerCase()));
+
+function applyKeyboardMovement(dt: number): void {
+  let dx = 0;
+  let dy = 0;
+  if (heldKeys.has("arrowup") || heldKeys.has("w")) dy -= 1;
+  if (heldKeys.has("arrowdown") || heldKeys.has("s")) dy += 1;
+  if (heldKeys.has("arrowleft") || heldKeys.has("a")) dx -= 1;
+  if (heldKeys.has("arrowright") || heldKeys.has("d")) dx += 1;
+  if (dx === 0 && dy === 0) return;
+  const len = Math.hypot(dx, dy);
+  target.x = Math.max(0, Math.min(state.width, target.x + (dx / len) * KEYBOARD_SPEED * dt));
+  target.y = Math.max(0, Math.min(state.height, target.y + (dy / len) * KEYBOARD_SPEED * dt));
+}
+
 window.addEventListener("resize", resize);
 resize();
 
@@ -94,6 +129,7 @@ let last = performance.now();
 function loop(now: number): void {
   const dt = Math.min(0.05, (now - last) / 1000);
   last = now;
+  applyKeyboardMovement(dt);
   stepGame(state, dt, target);
   render(ctx, state, now / 1000);
   requestAnimationFrame(loop);
