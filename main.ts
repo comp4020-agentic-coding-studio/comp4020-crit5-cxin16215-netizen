@@ -20,11 +20,17 @@ function resize(): void {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   state.width = window.innerWidth;
   state.height = window.innerHeight;
+  // Without this, shrinking the window leaves `target` sitting at its old,
+  // now out-of-bounds position -- since movement is delta-based, the player
+  // stays pinned to the wall nearest the stale target until enough mouse
+  // travel drags it back in, making the controls feel dead for a while.
+  target.x = Math.max(0, Math.min(state.width, target.x));
+  target.y = Math.max(0, Math.min(state.height, target.y));
 }
 
 function setTarget(clientX: number, clientY: number): void {
-  target.x = clientX;
-  target.y = clientY;
+  target.x = Math.max(0, Math.min(state.width, clientX));
+  target.y = Math.max(0, Math.min(state.height, clientY));
 }
 
 // Move by mouse DELTA, not absolute screen position -- so wherever the
