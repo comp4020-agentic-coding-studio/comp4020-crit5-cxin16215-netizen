@@ -68,6 +68,27 @@ export interface PowerUp {
 
 export type GameStatus = "playing" | "won" | "lost";
 
+export type GameEventKind = "eat" | "crush" | "powerup" | "spawn" | "death" | "win";
+
+/**
+ * A one-frame notification that something worth reacting to just happened.
+ * Logic pushes these; the presentation layers (fx.ts particles, audio.ts
+ * sounds) read them and decide what a player should see or hear. Keeping the
+ * reaction out of here is what lets game.ts stay DOM-free and testable while
+ * still driving screen shake and sound -- stepGame clears the list at the top
+ * of every call, so an event is visible for exactly the frame it happened on.
+ */
+export interface GameEvent {
+  kind: GameEventKind;
+  pos: Vec2;
+  /** Size of whatever was involved -- drives how big a burst the event earns. */
+  radius: number;
+  /** Points this event awarded, or 0 for events that don't score. */
+  points: number;
+  /** The combo count at the moment it fired. */
+  combo: number;
+}
+
 export interface GameState {
   width: number;
   height: number;
@@ -86,6 +107,12 @@ export interface GameState {
   magnetSpawnCooldown: number;
   timeLeft: number;
   status: GameStatus;
+  score: number;
+  /** Bites chained so far; reset to 0 whenever comboTimeLeft runs out. */
+  combo: number;
+  comboTimeLeft: number;
+  bestCombo: number;
+  events: GameEvent[];
 }
 
 export const START_RADIUS = 9;
@@ -172,6 +199,26 @@ export const POWERUP_RESPAWN_COOLDOWN = 12;
 // Give the opening seconds a "just you and the map" feel before any pickup
 // exists to chase.
 export const POWERUP_INITIAL_DELAY = 8;
+
+// Scoring exists to answer "how well", not "did you survive" -- win/lose is
+// still the goal, and none of this touches growth, so the round's balance is
+// unchanged. What it adds is a reason to play a second time.
+//
+// The combo is the real design lever. Without it every pellet is worth the
+// same, so the optimal line is "eat what's safe, avoid everything" and the
+// player never has a decision to make. A combo that lapses in COMBO_WINDOW_S
+// means holding a chain requires crossing the map at speed, which means
+// choosing to cross ground you'd otherwise route around -- and because a
+// crush refreshes the chain too, a hazard you *could* dodge becomes a hazard
+// worth eating. Risk stops being a mistake and becomes a bid.
+export const COMBO_WINDOW_S = 2.2;
+export const COMBO_STEP = 0.25;
+// Chain length past the first bite at which the multiplier stops climbing.
+export const COMBO_MAX_CHAIN = 9;
+export const FOOD_POINTS = 10;
+export const CRUSH_POINTS_PER_RADIUS = 6;
+export const WIN_BONUS = 500;
+export const TIME_BONUS_PER_S = 15;
 
 function dist(a: Vec2, b: Vec2): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
@@ -576,7 +623,19 @@ export function createInitialState(width: number, height: number): GameState {
     magnetSpawnCooldown: POWERUP_INITIAL_DELAY,
     timeLeft: TIME_LIMIT_S,
     status: "playing",
+    score: 0,
+    combo: 0,
+    comboTimeLeft: 0,
+    bestCombo: 0,
+    events: [],
   };
+}
+
+/** Extends the chain by one bite and restarts its lapse timer. */
+function bumpCombo(state: GameState): void {
+  state.combo += 1;
+  state.comboTimeLeft = COMBO_WINDOW_S;
+  if (state.combo > state.bestCombo) state.bestCombo = state.combo;
 }
 
 /**
@@ -596,6 +655,45 @@ export function isOutsideSafeZone(state: GameState): boolean {
   const center = { x: state.width / 2, y: state.height / 2 };
   const radius = safeZoneRadius(state.width, state.height, TIME_LIMIT_S - state.timeLeft);
   return dist(state.player.pos, center) > radius;
+}
+
+/**
+ * What a chain of `combo` bites is currently worth as a multiplier. The first
+ * bite of a chain is deliberately worth face value (1x) -- the reward is for
+ * *sustaining* a chain, not for eating at all -- and it stops climbing at
+ * COMBO_MAX_CHAIN so a lucky food cluster can't run away with the round.
+ */
+export function comboMultiplier(combo: number): number {
+  const chained = Math.max(0, Math.min(combo - 1, COMBO_MAX_CHAIN));
+  return 1 + chained * COMBO_STEP;
+}
+
+/** What one pellet pays at the given chain length. */
+export function foodPoints(combo: number): number {
+  return Math.round(FOOD_POINTS * comboMultiplier(combo));
+}
+
+/**
+ * What crushing something pays -- scaled by its radius, so the things that
+ * spent most of the round able to kill you are the ones worth eating.
+ */
+export function crushPoints(hazardRadius: number, combo: number): number {
+  return Math.round(hazardRadius * CRUSH_POINTS_PER_RADIUS * comboMultiplier(combo));
+}
+
+/**
+ * Gap (in pixels, edge to edge) to the nearest predator actively chasing, or
+ * Infinity when none is. Drives the danger vignette and the audio drone, so
+ * "a predator is closing" is something the player feels before they see the
+ * jaws -- proximity, not just presence.
+ */
+export function chaseThreatDistance(state: GameState): number {
+  let nearest = Infinity;
+  for (const p of state.predators) {
+    if (p.state !== "chase") continue;
+    nearest = Math.min(nearest, dist(state.player.pos, p.pos) - p.radius - state.player.radius);
+  }
+  return Math.max(0, nearest);
 }
 
 /** The one rule under a focused automated test: does growing into a hazard crush it, or does it kill you? */
@@ -659,6 +757,10 @@ function consumeFood(state: GameState): void {
   state.food = state.food.filter((f) => {
     if (dist(state.player.pos, f.pos) >= state.player.radius + f.radius) return true;
     state.player.radius += FOOD_GROWTH;
+    bumpCombo(state);
+    const points = foodPoints(state.combo);
+    state.score += points;
+    state.events.push({ kind: "eat", pos: { ...f.pos }, radius: f.radius, points, combo: state.combo });
     return false;
   });
   while (state.food.length < FOOD_COUNT) {
@@ -682,9 +784,19 @@ function trySpawnSecondPredator(state: GameState): void {
     { pos: state.player.pos, radius: state.player.radius + 60 },
     ...state.predators.map((p) => ({ pos: p.pos, radius: p.radius })),
   ];
-  state.predators.push(
-    makePredator(state.width, state.height, state.dangerBands, occupied, state.player.pos, state.walls),
+  const spawned = makePredator(
+    state.width,
+    state.height,
+    state.dangerBands,
+    occupied,
+    state.player.pos,
+    state.walls,
   );
+  state.predators.push(spawned);
+  // Telegraphed, not silent: a second hunter arriving unannounced reads as
+  // bad luck when it catches you. A sting and a jolt make it read as the
+  // round getting harder, which is the thing the escalation is for.
+  state.events.push({ kind: "spawn", pos: { ...spawned.pos }, radius: spawned.radius, points: 0, combo: state.combo });
 }
 
 function updatePredators(state: GameState, dt: number): void {
@@ -750,6 +862,7 @@ function stepPowerUps(state: GameState, dt: number): void {
     if (p.kind === "invincible") state.invincibleTimeLeft = INVINCIBLE_DURATION;
     else state.magnetTimeLeft = MAGNET_DURATION;
     setPowerUpCooldown(state, p.kind, POWERUP_RESPAWN_COOLDOWN);
+    state.events.push({ kind: "powerup", pos: { ...p.pos }, radius: p.radius, points: 0, combo: state.combo });
     return false;
   });
 
@@ -770,8 +883,37 @@ function stepPowerUps(state: GameState, dt: number): void {
   state.magnetTimeLeft = Math.max(0, state.magnetTimeLeft - dt);
 }
 
+/** Banks a crush: it pays by size, and (like a pellet) it keeps the chain alive. */
+function scoreCrush(state: GameState, pos: Vec2, radius: number): void {
+  bumpCombo(state);
+  const points = crushPoints(radius, state.combo);
+  state.score += points;
+  state.events.push({ kind: "crush", pos: { ...pos }, radius, points, combo: state.combo });
+}
+
+/** Ends the round on an impact, leaving a death event at the point of failure. */
+function die(state: GameState): GameState {
+  state.status = "lost";
+  state.events.push({
+    kind: "death",
+    pos: { ...state.player.pos },
+    radius: state.player.radius,
+    points: 0,
+    combo: state.combo,
+  });
+  return state;
+}
+
 export function stepGame(state: GameState, dt: number, target: Vec2): GameState {
+  // Cleared before the status guard, so a death event survives exactly one
+  // frame -- long enough for fx/audio to read it, gone before the next.
+  state.events.length = 0;
   if (state.status !== "playing") return state;
+
+  if (state.comboTimeLeft > 0) {
+    state.comboTimeLeft = Math.max(0, state.comboTimeLeft - dt);
+    if (state.comboTimeLeft === 0) state.combo = 0;
+  }
 
   const ease = 1 - Math.exp(-FOLLOW_EASE * dt);
   state.player.pos.x += (target.x - state.player.pos.x) * ease;
@@ -793,11 +935,9 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
   const survivors: Hazard[] = [];
   for (const hazard of state.hazards) {
     const verdict = withInvincibility(resolveHazardCollision(state.player, hazard), state.invincibleTimeLeft);
-    if (verdict === "die") {
-      state.status = "lost";
-      return state;
-    }
-    if (verdict !== "crush") survivors.push(hazard);
+    if (verdict === "die") return die(state);
+    if (verdict === "crush") scoreCrush(state, hazard.pos, hazard.radius);
+    else survivors.push(hazard);
   }
   state.hazards = survivors;
 
@@ -807,11 +947,9 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
       resolveHazardCollision(state.player, { ...predator, tier: 2 }),
       state.invincibleTimeLeft,
     );
-    if (verdict === "die") {
-      state.status = "lost";
-      return state;
-    }
-    if (verdict !== "crush") survivingPredators.push(predator);
+    if (verdict === "die") return die(state);
+    if (verdict === "crush") scoreCrush(state, predator.pos, predator.radius);
+    else survivingPredators.push(predator);
   }
   state.predators = survivingPredators;
 
@@ -821,16 +959,25 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
   // the terrain."
   if (isOutsideSafeZone(state)) {
     state.player.radius -= SAFE_ZONE_DRAIN_PER_S * dt;
-    if (state.player.radius < MIN_SURVIVABLE_RADIUS) {
-      state.status = "lost";
-      return state;
-    }
+    if (state.player.radius < MIN_SURVIVABLE_RADIUS) return die(state);
   }
 
   state.timeLeft -= dt;
   if (state.player.radius >= WIN_RADIUS) {
     state.status = "won";
+    // Winning with time to spare should beat scraping in on the buzzer --
+    // otherwise the safest possible line is also the highest-scoring one.
+    state.score += WIN_BONUS + Math.round(state.timeLeft * TIME_BONUS_PER_S);
+    state.events.push({
+      kind: "win",
+      pos: { ...state.player.pos },
+      radius: state.player.radius,
+      points: 0,
+      combo: state.combo,
+    });
   } else if (state.timeLeft <= 0) {
+    // Running the clock out isn't an impact -- no death event, so it fades
+    // out rather than detonating.
     state.timeLeft = 0;
     state.status = "lost";
   }

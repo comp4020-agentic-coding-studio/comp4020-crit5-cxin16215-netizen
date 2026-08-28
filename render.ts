@@ -2,6 +2,9 @@
 // needs a test. game.ts decides what happened; this just paints it.
 
 import {
+  chaseThreatDistance,
+  comboMultiplier,
+  COMBO_WINDOW_S,
   CRUSH_RATIO,
   FOOD_RADIUS,
   INVINCIBLE_DURATION,
@@ -13,10 +16,33 @@ import {
   type GameState,
   type Predator,
 } from "./game.ts";
+import type { FxState } from "./fx.ts";
+
+/**
+ * The bits of the HUD that aren't the game's business: a personal best lives
+ * in localStorage and the mute flag lives in the audio graph, so both are
+ * handed in by main.ts rather than stored on GameState.
+ */
+export interface HudInfo {
+  best: number;
+  newBest: boolean;
+  muted: boolean;
+}
+
+// Digits only, monospaced: the end screen deliberately has no words (see
+// drawEndOverlay), and numerals are the one readout that needs no
+// translation. Monospace also stops a rising score from jittering its own
+// layout as digit widths change.
+const NUMERIC_FONT = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
 const PLAYER_COLOR = "#7cf2c0";
 const FOOD_COLOR = "#c8ff6e";
 const DANGER_COLOR = "#ff2d4d";
+// Reserved for score achievement -- a hot combo, a live score past your
+// record, a new best on the end screen. Kept distinct from every diegetic
+// colour so "you are doing well" never reads as "that is a thing in the
+// swamp".
+const GOLD_COLOR = "#ffe066";
 // Reserved for the magnet power-up's abstract ability glyph -- not a
 // diegetic swamp element, so it keeps its own cool, magical tone rather than
 // following the bioluminescent-spore palette everything else uses.
@@ -173,19 +199,36 @@ function drawSafeZone(ctx: CanvasRenderingContext2D, state: GameState, clockSeco
   ctx.setLineDash([]);
 }
 
-export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
+export function render(
+  ctx: CanvasRenderingContext2D,
+  state: GameState,
+  fx: FxState,
+  hud: HudInfo,
+  clockSeconds: number,
+): void {
   const { width, height } = state;
-  ctx.clearRect(0, 0, width, height);
+  // No clearRect: the background gradient below is fully opaque and covers
+  // the whole canvas, so clearing first was a second full-screen write per
+  // frame for no visible effect. At a 1.5x backing store on a 1080p window
+  // that alone is ~4.7M redundant pixel writes every frame.
   ctx.fillStyle = getBackgroundGradient(ctx, width, height);
   ctx.fillRect(0, 0, width, height);
-  drawSafeZone(ctx, state, clockSeconds);
 
+  const pulse = 1 + Math.sin(clockSeconds * 6) * 0.06;
+
+  // Only the world shakes. Letting the HUD ride along would make the score
+  // and timer unreadable at exactly the moments they matter most.
+  ctx.save();
+  if (fx.shake > 0) {
+    ctx.translate((Math.random() - 0.5) * 2 * fx.shake, (Math.random() - 0.5) * 2 * fx.shake);
+  }
+
+  drawSafeZone(ctx, state, clockSeconds);
   drawGrass(ctx, state, clockSeconds);
   drawWalls(ctx, state, clockSeconds);
   drawFood(ctx, state);
   drawPowerUps(ctx, state, clockSeconds);
 
-  const pulse = 1 + Math.sin(clockSeconds * 6) * 0.06;
   for (const hazard of state.hazards) {
     drawHazard(ctx, state, hazard, pulse);
   }
@@ -194,15 +237,127 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSec
   }
 
   drawPlayer(ctx, state, isOutsideSafeZone(state));
+  drawParticles(ctx, fx);
+  ctx.restore();
+
+  drawThreatVignette(ctx, state, clockSeconds);
+  drawFlash(ctx, fx, width, height);
+  // Floating numbers sit above the vignette so a score never gets dimmed by
+  // the thing that made it exciting to earn.
+  drawFloatingNumbers(ctx, fx);
+
   drawGrowthMeter(ctx, state);
   drawTimer(ctx, state);
+  drawScore(ctx, state, hud, clockSeconds);
+  drawComboMeter(ctx, state);
   drawBuffBadge(ctx, state.invincibleTimeLeft, INVINCIBLE_DURATION, 0, PLAYER_COLOR);
   drawBuffBadge(ctx, state.magnetTimeLeft, MAGNET_DURATION, 1, CRYSTAL_COLOR);
+  drawMuteGlyph(ctx, state, hud);
 
   if (state.status !== "playing") {
-    drawEndOverlay(ctx, state, pulse);
+    drawEndOverlay(ctx, state, hud, pulse);
   }
 }
+
+function drawParticles(ctx: CanvasRenderingContext2D, fx: FxState): void {
+  for (const p of fx.particles) {
+    const t = p.life / p.maxLife;
+    ctx.globalAlpha = Math.min(1, t * 1.5);
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.pos.x, p.pos.y, p.radius * (0.35 + t * 0.65), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFloatingNumbers(ctx: CanvasRenderingContext2D, fx: FxState): void {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const n of fx.numbers) {
+    const t = n.life / n.maxLife;
+    ctx.globalAlpha = Math.min(1, t * 1.8);
+    ctx.font = `700 ${n.size}px ${NUMERIC_FONT}`;
+    // A dark outline instead of a glow. These are the most numerous blurred
+    // draws in the game (one per number, dozens mid-combo) and strokeText
+    // costs a fraction of a blur layer while reading better over bright
+    // particle bursts.
+    ctx.lineWidth = 3;
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = "rgba(4,12,8,0.7)";
+    ctx.strokeText(n.text, n.pos.x, n.pos.y);
+    ctx.fillStyle = n.color;
+    ctx.fillText(n.text, n.pos.x, n.pos.y);
+  }
+  ctx.globalAlpha = 1;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+/**
+ * Reddens the edges of the screen as danger closes in. Presence was already
+ * legible (a chasing predator glows red); what was missing was *proximity* --
+ * this makes the last second before the jaws feel different from the first,
+ * and it doubles as the warning for the two threats that have no sprite at
+ * all: the clock, and standing outside the safe zone.
+ */
+let vignetteGradient: CanvasGradient | null = null;
+let vignetteW = -1;
+let vignetteH = -1;
+
+function drawThreatVignette(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
+  if (state.status !== "playing") return;
+  const { width, height } = state;
+  const gap = chaseThreatDistance(state);
+  const proximity = Number.isFinite(gap) ? Math.max(0, 1 - gap / 300) : 0;
+  const clock = state.timeLeft < 10 ? (10 - state.timeLeft) / 10 : 0;
+  const zone = isOutsideSafeZone(state) ? 0.85 : 0;
+  // Max, not sum: three dangers at once is still one screen's worth of red.
+  const intensity = Math.min(0.9, Math.max(proximity * proximity, clock * 0.75, zone));
+  if (intensity < 0.02) return;
+
+  // Built at full strength once per canvas size and modulated with
+  // globalAlpha, rather than rebuilt every frame just to change one stop's
+  // opacity -- this is a full-screen fill, so it was never cheap.
+  const pulse = 0.86 + Math.sin(clockSeconds * 7) * 0.14;
+  if (!vignetteGradient || vignetteW !== width || vignetteH !== height) {
+    vignetteGradient = ctx.createRadialGradient(
+      width / 2,
+      height / 2,
+      Math.min(width, height) * 0.3,
+      width / 2,
+      height / 2,
+      Math.hypot(width, height) / 2,
+    );
+    vignetteGradient.addColorStop(0, "rgba(255,45,77,0)");
+    vignetteGradient.addColorStop(1, "rgba(255,45,77,1)");
+    vignetteW = width;
+    vignetteH = height;
+  }
+  ctx.globalAlpha = Math.min(1, intensity * 0.6 * pulse);
+  ctx.fillStyle = vignetteGradient;
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalAlpha = 1;
+}
+
+function drawFlash(ctx: CanvasRenderingContext2D, fx: FxState, width: number, height: number): void {
+  if (fx.flash <= 0) return;
+  ctx.globalAlpha = fx.flash;
+  ctx.fillStyle = fx.flashColor;
+  ctx.globalCompositeOperation = "lighter";
+  ctx.fillRect(0, 0, width, height);
+  ctx.globalCompositeOperation = "source-over";
+  ctx.globalAlpha = 1;
+}
+
+// shadowBlur/shadowColor are persistent context state -- they leak onto
+// whatever's drawn next unless reset immediately after the call that wants
+// them, so every glow below is set right before its fill/stroke and cleared
+// right after. Reserved for the small, bounded entity counts (player,
+// hazards, predator, power-ups, the gate-gap crystal clusters, the timer
+// arc); the ~30 food shards get their glow via a gradient that fades to
+// transparent instead, since a real shadowBlur pass on that many shapes
+// every frame isn't worth the cost.
 
 // A jagged silhouette around a boulder's circle, offset deterministically
 // from its own position -- never Math.random(), or the rock face would
@@ -613,7 +768,9 @@ function drawBuffBadge(
 ): void {
   if (timeLeft <= 0) return;
   const cx = 32 + slot * 36;
-  const cy = 50;
+  // Sits below the combo meter: the left column reads top-to-bottom as one
+  // group -- how big you are, how hot your chain is, what's buffing you.
+  const cy = 84;
   const r = 12;
   ctx.strokeStyle = "rgba(18,59,69,0.4)";
   ctx.lineWidth = 3;
@@ -675,6 +832,125 @@ function drawGrowthMeter(ctx: CanvasRenderingContext2D, state: GameState): void 
   ctx.strokeRect(x, y, w, h);
 }
 
+// A star, not the word "best" -- see drawEndOverlay on why this HUD stays
+// wordless. Returns the width it drew so callers can centre star+number as
+// one group.
+function drawBestBadge(
+  ctx: CanvasRenderingContext2D,
+  best: number,
+  cx: number,
+  cy: number,
+  size: number,
+  // The in-play HUD wants this quiet; the end screen has to stay readable on
+  // top of a win burst, so it passes a solid colour and a glow.
+  color = "rgba(232,255,245,0.5)",
+  glow = false,
+): void {
+  if (best <= 0) return;
+  const label = String(best);
+  ctx.font = `600 ${size}px ${NUMERIC_FONT}`;
+  const starR = size * 0.42;
+  const groupWidth = starR * 2 + 6 + ctx.measureText(label).width;
+  const left = cx - groupWidth / 2;
+
+  ctx.fillStyle = color;
+  if (glow) {
+    ctx.shadowColor = "rgba(0,0,0,0.9)";
+    ctx.shadowBlur = 8;
+  }
+  pathStar(ctx, left + starR, cy, starR, starR * 0.45, 5);
+  ctx.fill();
+
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, left + starR * 2 + 6, cy);
+  ctx.shadowBlur = 0;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+}
+
+function drawScore(ctx: CanvasRenderingContext2D, state: GameState, hud: HudInfo, clockSeconds: number): void {
+  const cx = state.width / 2;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+
+  // Passing your own record mid-round is the moment worth selling, so the
+  // live score goes gold the instant it happens rather than waiting for the
+  // end screen to tell you.
+  const beating = hud.best > 0 && state.score > hud.best;
+  const color = beating ? GOLD_COLOR : "#e8fff5";
+  ctx.font = `700 30px ${NUMERIC_FONT}`;
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = beating ? 12 + Math.sin(clockSeconds * 6) * 6 : 8;
+  ctx.fillText(String(state.score), cx, 34);
+  ctx.shadowBlur = 0;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+
+  drawBestBadge(ctx, hud.best, cx, 60, 13);
+}
+
+// The chain's lapse timer, drawn where the eye already is for the growth
+// meter. It reads as "spend this now" -- which is the whole point of the
+// combo: it should make standing still feel expensive.
+function drawComboMeter(ctx: CanvasRenderingContext2D, state: GameState): void {
+  if (state.combo < 2 || state.comboTimeLeft <= 0) return;
+  const x = 20;
+  const w = 140;
+  const heat = Math.min(1, (state.combo - 1) / 9);
+  const color = heat > 0.55 ? GOLD_COLOR : PLAYER_COLOR;
+
+  ctx.font = `700 14px ${NUMERIC_FONT}`;
+  ctx.fillStyle = color;
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 6;
+  ctx.fillText(`×${comboMultiplier(state.combo).toFixed(2)}`, x, 52);
+  ctx.shadowBlur = 0;
+
+  const y = 60;
+  ctx.fillStyle = "rgba(18,59,69,0.35)";
+  ctx.fillRect(x, y, w, 4);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y, w * (state.comboTimeLeft / COMBO_WINDOW_S), 4);
+}
+
+// A speaker in the corner, dim: the only hint that sound exists and that a
+// key toggles it. Drawing it always (rather than only when muted) is what
+// makes the mute discoverable at all.
+function drawMuteGlyph(ctx: CanvasRenderingContext2D, state: GameState, hud: HudInfo): void {
+  const x = state.width - 30;
+  const y = state.height - 26;
+  ctx.strokeStyle = hud.muted ? "rgba(255,45,77,0.55)" : "rgba(232,255,245,0.32)";
+  ctx.fillStyle = ctx.strokeStyle;
+  ctx.lineWidth = 1.6;
+
+  ctx.beginPath();
+  ctx.moveTo(x - 7, y - 3);
+  ctx.lineTo(x - 3, y - 3);
+  ctx.lineTo(x + 1, y - 7);
+  ctx.lineTo(x + 1, y + 7);
+  ctx.lineTo(x - 3, y + 3);
+  ctx.lineTo(x - 7, y + 3);
+  ctx.closePath();
+  ctx.fill();
+
+  if (hud.muted) {
+    ctx.beginPath();
+    ctx.moveTo(x + 4, y - 5);
+    ctx.lineTo(x + 11, y + 5);
+    ctx.moveTo(x + 11, y - 5);
+    ctx.lineTo(x + 4, y + 5);
+    ctx.stroke();
+  } else {
+    ctx.beginPath();
+    ctx.arc(x + 2, y, 5, -Math.PI / 3, Math.PI / 3);
+    ctx.moveTo(x + 8.5, y - 5);
+    ctx.arc(x + 2, y, 8, -Math.PI / 3, Math.PI / 3);
+    ctx.stroke();
+  }
+}
+
 function drawTimer(ctx: CanvasRenderingContext2D, state: GameState): void {
   const cx = state.width - 34;
   const cy = 34;
@@ -696,9 +972,13 @@ function drawTimer(ctx: CanvasRenderingContext2D, state: GameState): void {
   ctx.shadowBlur = 0;
 }
 
-// No words on a loss or a win -- a play/replay glyph is the only affordance,
-// and tapping anywhere on it restarts.
-function drawEndOverlay(ctx: CanvasRenderingContext2D, state: GameState, pulse: number): void {
+// Still no words on a loss or a win -- a play/replay glyph remains the only
+// affordance, and tapping anywhere restarts. What's added is the round's
+// score and your record, because an end screen that reports nothing gives a
+// player no reason to go again and no way to tell a good run from a lucky
+// one. Numerals and a star carry that without breaking the wordless rule:
+// they need no translation and no reading.
+function drawEndOverlay(ctx: CanvasRenderingContext2D, state: GameState, hud: HudInfo, pulse: number): void {
   const { width, height, status } = state;
   const won = status === "won";
   ctx.fillStyle = won ? "rgba(80,255,190,0.18)" : "rgba(255,45,77,0.22)";
@@ -706,14 +986,40 @@ function drawEndOverlay(ctx: CanvasRenderingContext2D, state: GameState, pulse: 
 
   const cx = width / 2;
   const cy = height / 2;
-  const r = 34 * pulse;
+  const scoreColor = hud.newBest ? GOLD_COLOR : "#f4fffb";
+
+  // A new record gets a pulsing ring rather than a "NEW BEST!" banner --
+  // same signal, no language.
+  if (hud.newBest) {
+    ctx.strokeStyle = `rgba(255,224,102,${0.35 + Math.sin(pulse * 30) * 0.2})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(cx, cy - 62, 62 * pulse, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `700 46px ${NUMERIC_FONT}`;
+  ctx.fillStyle = scoreColor;
+  ctx.shadowColor = scoreColor;
+  ctx.shadowBlur = 18;
+  ctx.fillText(String(state.score), cx, cy - 62);
+  ctx.shadowBlur = 0;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+
+  drawBestBadge(ctx, hud.best, cx, cy - 22, 16, "rgba(244,255,251,0.92)", true);
+
+  const r = 30 * pulse;
+  const glyphY = cy + 44;
   ctx.fillStyle = "#f4fffb";
   ctx.shadowColor = won ? PLAYER_COLOR : DANGER_COLOR;
   ctx.shadowBlur = 20;
   ctx.beginPath();
-  ctx.moveTo(cx - r * 0.5, cy - r * 0.75);
-  ctx.lineTo(cx - r * 0.5, cy + r * 0.75);
-  ctx.lineTo(cx + r * 0.75, cy);
+  ctx.moveTo(cx - r * 0.5, glyphY - r * 0.75);
+  ctx.lineTo(cx - r * 0.5, glyphY + r * 0.75);
+  ctx.lineTo(cx + r * 0.75, glyphY);
   ctx.closePath();
   ctx.fill();
   ctx.shadowBlur = 0;

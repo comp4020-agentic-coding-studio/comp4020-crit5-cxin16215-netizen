@@ -2,7 +2,9 @@
 // here -- they're all in game.ts, which is what spec/crush-rule.test.ts
 // exercises directly.
 
+import { isMuted, playEvents, toggleMute, unlockAudio, updateAudio } from "./audio.ts";
 import { createInitialState, stepGame, type GameState, type Vec2 } from "./game.ts";
+import { createFxState, emitFx, resetFx, stepFx } from "./fx.ts";
 import { render } from "./render.ts";
 
 const canvas = document.querySelector<HTMLCanvasElement>("#game")!;
@@ -10,9 +12,70 @@ const ctx = canvas.getContext("2d")!;
 
 let state: GameState = createInitialState(window.innerWidth, window.innerHeight);
 const target: Vec2 = { x: state.player.pos.x, y: state.player.pos.y };
+const fx = createFxState();
+
+// The personal best is the whole reason to play a second time, so it has to
+// outlive the tab. localStorage can throw outright (Safari private mode, a
+// browser set to block site data) rather than merely returning null, and a
+// missing high score is never worth taking the game down over -- so both
+// sides are wrapped and a failure just means "no record yet".
+const BEST_KEY = "swell.best";
+
+function loadBest(): number {
+  try {
+    const raw = Number(window.localStorage.getItem(BEST_KEY));
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function saveBest(value: number): void {
+  try {
+    window.localStorage.setItem(BEST_KEY, String(value));
+  } catch {
+    /* no persistence available -- the in-memory best still holds for this tab */
+  }
+}
+
+let best = loadBest();
+let newBest = false;
+// Guards the one-shot record write: stepGame keeps returning an ended state
+// every frame, and without this the end screen would re-bank the same score
+// forever.
+let scoreBanked = false;
+
+function restart(): void {
+  state = createInitialState(window.innerWidth, window.innerHeight);
+  target.x = state.player.pos.x;
+  target.y = state.player.pos.y;
+  resetFx(fx);
+  newBest = false;
+  scoreBanked = false;
+}
+
+// Records the finished round exactly once. Called from the loop rather than
+// from the death sites, so it catches every way a round can end -- crushed,
+// drained, timed out or won -- without game.ts needing to know storage exists.
+function bankScore(): void {
+  if (scoreBanked) return;
+  scoreBanked = true;
+  if (state.score > best) {
+    best = state.score;
+    newBest = true;
+    saveBest(best);
+  }
+}
+
+// Backing-store resolution is the biggest lever on frame time here, because
+// this renderer is fill-rate bound rather than CPU bound. Uncapped, a
+// 1920x1080 window on a 2x display renders 3840x2160 -- 8.3M pixels a frame.
+// Capping at 1.5 cuts that by 44% for a difference you have to hunt for on
+// soft-edged art like this.
+const MAX_DPR = 1.5;
 
 function resize(): void {
-  const dpr = window.devicePixelRatio || 1;
+  const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
   canvas.width = window.innerWidth * dpr;
   canvas.height = window.innerHeight * dpr;
   canvas.style.width = `${window.innerWidth}px`;
@@ -67,6 +130,10 @@ function isLocked(): boolean {
 }
 
 canvas.addEventListener("pointerdown", (e) => {
+  // Browsers refuse to start audio before a gesture, so this is the earliest
+  // legitimate moment to build the audio graph.
+  unlockAudio();
+
   if (e.pointerType !== "touch" && !isLocked()) {
     // Rejects (e.g. the browser's re-lock cooldown right after Escape) are
     // expected and harmless -- the next click just tries again.
@@ -82,9 +149,7 @@ canvas.addEventListener("pointerdown", (e) => {
     }
     return;
   }
-  state = createInitialState(window.innerWidth, window.innerHeight);
-  target.x = state.player.pos.x;
-  target.y = state.player.pos.y;
+  restart();
 });
 
 // Keyboard is a full alternative to the pointer: arrow keys/WASD nudge the
@@ -96,15 +161,17 @@ const MOVE_KEYS = new Set(["arrowup", "arrowdown", "arrowleft", "arrowright", "w
 const heldKeys = new Set<string>();
 
 window.addEventListener("keydown", (e) => {
+  unlockAudio();
   const key = e.key.toLowerCase();
   if (MOVE_KEYS.has(key)) {
     heldKeys.add(key);
     e.preventDefault();
+  } else if (key === "m") {
+    e.preventDefault();
+    toggleMute();
   } else if (state.status !== "playing" && (key === "enter" || key === " ")) {
     e.preventDefault();
-    state = createInitialState(window.innerWidth, window.innerHeight);
-    target.x = state.player.pos.x;
-    target.y = state.player.pos.y;
+    restart();
   }
 });
 window.addEventListener("keyup", (e) => heldKeys.delete(e.key.toLowerCase()));
@@ -131,7 +198,16 @@ function loop(now: number): void {
   last = now;
   applyKeyboardMovement(dt);
   stepGame(state, dt, target);
-  render(ctx, state, now / 1000);
+
+  // stepGame's events live for exactly this frame, so both consumers read
+  // them here, before anything can clear them.
+  emitFx(fx, state.events);
+  playEvents(state.events);
+  updateAudio(state);
+  if (state.status !== "playing") bankScore();
+
+  stepFx(fx, dt);
+  render(ctx, state, fx, { best, newBest, muted: isMuted() }, now / 1000);
   requestAnimationFrame(loop);
 }
 requestAnimationFrame(loop);
