@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   PREDATOR_DETECT_RADIUS,
+  PREDATOR_GRACE_S,
   PREDATOR_LOSE_RADIUS,
+  TIME_LIMIT_S,
   createInitialState,
   isPlayerHidden,
   nextPredatorState,
+  stepGame,
   withInvincibility,
   type GameState,
 } from "../game.ts";
@@ -57,6 +60,55 @@ describe("nextPredatorState", () => {
 
   it("leaves search alone -- the give-up-to-patrol edge needs a timer, handled by the caller", () => {
     expect(nextPredatorState("search", true, 0)).toBe("search");
+  });
+
+  it("cannot acquire a target during the opening grace", () => {
+    expect(nextPredatorState("patrol", false, 0, true)).toBe("patrol");
+  });
+
+  it("still breaks off a chase during grace -- grace blocks acquiring, not losing", () => {
+    expect(nextPredatorState("chase", true, 0, true)).toBe("search");
+  });
+});
+
+// The opening has to be survivable. A predator that spawns already inside its
+// own detection radius kills the player at t~1s with no agency and no score,
+// which is the one outcome a 60-second round can't afford -- so both halves
+// of that promise get a test.
+describe("a survivable opening", () => {
+  it("never spawns a predator already able to see the player", () => {
+    // Placement is random, so this is a repeated draw rather than one case.
+    for (let i = 0; i < 60; i++) {
+      const state = createInitialState(900, 650);
+      for (const predator of state.predators) {
+        const gap = Math.hypot(
+          predator.pos.x - state.player.pos.x,
+          predator.pos.y - state.player.pos.y,
+        );
+        expect(gap).toBeGreaterThan(PREDATOR_DETECT_RADIUS);
+      }
+    }
+  });
+
+  it("holds every predator off the player through the grace window", () => {
+    const state = createInitialState(900, 650);
+    // Park a predator right on top of the player: even point-blank and in the
+    // open, grace must keep it patrolling.
+    state.grass = [];
+    state.predators[0].pos = { x: state.player.pos.x + 5, y: state.player.pos.y };
+
+    stepGame(state, 0.016, { ...state.player.pos });
+    expect(state.predators[0]?.state).toBe("patrol");
+  });
+
+  it("lets predators hunt again once grace has expired", () => {
+    const state = createInitialState(900, 650);
+    state.grass = [];
+    state.timeLeft = TIME_LIMIT_S - PREDATOR_GRACE_S - 1;
+    state.predators[0].pos = { x: state.player.pos.x + 60, y: state.player.pos.y };
+
+    stepGame(state, 0.016, { ...state.player.pos });
+    expect(state.predators[0]?.state).toBe("chase");
   });
 });
 

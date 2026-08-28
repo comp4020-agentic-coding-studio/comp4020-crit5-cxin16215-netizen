@@ -122,6 +122,28 @@ export const PREDATOR_LOSE_RADIUS = 320;
 export const PREDATOR_PATROL_SPEED = 60;
 export const PREDATOR_CHASE_SPEED = 130;
 export const PREDATOR_SEARCH_TIME = 3;
+// Two guarantees about the opening, which previously had neither.
+//
+// A predator's home band can sit as close as ~130px to the centre spawn, and
+// placeAvoiding only demanded 100px -- comfortably inside DETECT_RADIUS. So a
+// round could legitimately begin with a predator already locked on, closing
+// at chase speed, killing the player at t~1s before they had eaten anything
+// or learned a rule. Losing with no agency and no score is the one outcome a
+// 60-second round can't afford.
+//
+// CLEARANCE keeps a spawning predator outside its own detection range (which
+// also covers the mid-round second predator, whose arrival is worse still --
+// the player is busy). GRACE then stops any predator from acquiring at all
+// for the first few seconds, so the opening is reliably about learning the
+// map. Neither weakens the other 56 seconds.
+// Sized against how placeAvoiding actually reads it: farEnough demands
+// `dist > radius + minGap`, and minGap is 40 here, so this yields a real
+// 240px exclusion -- clear of DETECT_RADIUS with room to spare. Asking for
+// much more starts failing the random search often enough that the fallback
+// below becomes the common path, and a predator that's reliably in a corner
+// is its own kind of bad design.
+export const PREDATOR_SPAWN_CLEARANCE = 200;
+export const PREDATOR_GRACE_S = 4;
 // A second hunter joins partway through the round -- picked so it lands
 // after the safe zone has already started closing in (see below), stacking
 // two escalation points instead of one.
@@ -424,16 +446,66 @@ function outerBands(height: number, dangerBands: [number, number]): YRange[] {
 // placeAvoiding used for hazards/food/grass. `walls` is only needed for a
 // mid-round spawn (createInitialState already folds cluster footprints into
 // `occupied` before this runs).
+/**
+ * placeAvoiding gives up after a bounded number of tries and returns an
+ * *unconstrained* point -- fine for food, fatal for a predator, since it
+ * quietly reintroduces the spawn-already-hunting-you case the clearance
+ * exists to rule out. This is the backstop: if the search came back too
+ * close, take whichever corner of the predator's own band is furthest from
+ * the player, which on any reasonable viewport is several hundred pixels
+ * clear. Rare by design -- see PREDATOR_SPAWN_CLEARANCE on why.
+ */
+function farthestBandCornerIfTooClose(
+  pos: Vec2,
+  playerPos: Vec2,
+  width: number,
+  height: number,
+  band: YRange,
+): Vec2 {
+  if (dist(pos, playerPos) > PREDATOR_SPAWN_CLEARANCE + 40) return pos;
+  const margin = PREDATOR_RADIUS + 10;
+  const yLow = Math.max(band.minY, margin);
+  const yHigh = Math.max(yLow, Math.min(band.maxY, height - margin));
+  const xLow = margin;
+  const xHigh = Math.max(xLow, width - margin);
+
+  let best = pos;
+  let bestDist = -1;
+  for (const x of [xLow, xHigh]) {
+    for (const y of [yLow, yHigh]) {
+      const candidate = { x, y };
+      const d = dist(candidate, playerPos);
+      if (d > bestDist) {
+        bestDist = d;
+        best = candidate;
+      }
+    }
+  }
+  return best;
+}
+
 function makePredator(
   width: number,
   height: number,
   dangerBands: [number, number],
   occupied: { pos: Vec2; radius: number }[],
+  playerPos: Vec2,
   walls: Boulder[] = [],
 ): Predator {
   const bands = outerBands(height, dangerBands);
   const homeBand = bands[Math.floor(Math.random() * bands.length)];
-  const pos = placeAvoiding(width, height, PREDATOR_RADIUS, occupied, 40, 80, homeBand, walls);
+  // The player gets their own oversized exclusion on top of whatever's
+  // already in `occupied` -- the generic 60px entry there is about not
+  // spawning on top of each other, which is a much weaker promise than "far
+  // enough away that it can't already see you".
+  const avoid = [...occupied, { pos: playerPos, radius: PREDATOR_SPAWN_CLEARANCE }];
+  const pos = farthestBandCornerIfTooClose(
+    placeAvoiding(width, height, PREDATOR_RADIUS, avoid, 40, 80, homeBand, walls),
+    playerPos,
+    width,
+    height,
+    homeBand,
+  );
   occupied.push({ pos, radius: PREDATOR_RADIUS });
   return {
     pos,
@@ -478,7 +550,7 @@ export function createInitialState(width: number, height: number): GameState {
   // The predator takes over tier 2's old role -- biggest, deadliest, and
   // confined to a random outer band so it's never right on top of spawn. A
   // second one joins mid-round -- see trySpawnSecondPredator.
-  const predators = [makePredator(width, height, dangerBands, occupied)];
+  const predators = [makePredator(width, height, dangerBands, occupied, player.pos)];
 
   const grass: Grass[] = [];
   for (let i = 0; i < GRASS_COUNT; i++) {
@@ -557,10 +629,18 @@ export function isPlayerHidden(state: GameState): boolean {
  * of which depend on `dt` -- that transition is handled by the caller
  * (`updatePredator`) rather than here.
  */
-export function nextPredatorState(current: PredatorState, hidden: boolean, distToPlayer: number): PredatorState {
+export function nextPredatorState(
+  current: PredatorState,
+  hidden: boolean,
+  distToPlayer: number,
+  graceActive = false,
+): PredatorState {
   if (current === "chase") {
     return hidden || distToPlayer > PREDATOR_LOSE_RADIUS ? "search" : "chase";
   }
+  // Grace blocks acquiring a target, never breaking off one already held --
+  // it protects the opening, it isn't a shield the player can re-trigger.
+  if (graceActive) return current;
   if (!hidden && distToPlayer < PREDATOR_DETECT_RADIUS) return "chase";
   return current;
 }
@@ -602,7 +682,9 @@ function trySpawnSecondPredator(state: GameState): void {
     { pos: state.player.pos, radius: state.player.radius + 60 },
     ...state.predators.map((p) => ({ pos: p.pos, radius: p.radius })),
   ];
-  state.predators.push(makePredator(state.width, state.height, state.dangerBands, occupied, state.walls));
+  state.predators.push(
+    makePredator(state.width, state.height, state.dangerBands, occupied, state.player.pos, state.walls),
+  );
 }
 
 function updatePredators(state: GameState, dt: number): void {
@@ -613,7 +695,8 @@ function updateOnePredator(state: GameState, p: Predator, dt: number): void {
   const hidden = isPlayerHidden(state);
   const distToPlayer = dist(p.pos, state.player.pos);
   const wasChasing = p.state === "chase";
-  p.state = nextPredatorState(p.state, hidden, distToPlayer);
+  const graceActive = TIME_LIMIT_S - state.timeLeft < PREDATOR_GRACE_S;
+  p.state = nextPredatorState(p.state, hidden, distToPlayer, graceActive);
 
   if (p.state === "chase") {
     p.lastKnownPlayerPos = { ...state.player.pos };
