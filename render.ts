@@ -3,23 +3,34 @@
 
 import {
   CRUSH_RATIO,
+  FOOD_RADIUS,
   INVINCIBLE_DURATION,
+  isOutsideSafeZone,
   MAGNET_DURATION,
+  safeZoneRadius,
   TIME_LIMIT_S,
   WIN_RADIUS,
   type GameState,
+  type Predator,
 } from "./game.ts";
 
 const PLAYER_COLOR = "#7cf2c0";
-const FOOD_COLOR = "#ffe98a";
+const FOOD_COLOR = "#c8ff6e";
 const DANGER_COLOR = "#ff2d4d";
+// Reserved for the magnet power-up's abstract ability glyph -- not a
+// diegetic swamp element, so it keeps its own cool, magical tone rather than
+// following the bioluminescent-spore palette everything else uses.
 const CRYSTAL_COLOR = "#8ad9ff";
+// The primordial-swamp glow color: vine-tip spores, food, anything meant to
+// read as bioluminescent plant life rather than mineral or magic.
+const SPORE_COLOR = "#c8ff6e";
 
-// Two entries -- one per remaining static hazard tier (bat, then urchin).
-// Tier 2's old slot was retired when the predator took over that danger tier.
+// Two entries -- one per remaining static hazard tier (dragonfly, then
+// spiky seed-pod). Tier 2's old slot was retired when the predator took
+// over that danger tier.
 const HAZARD_GRADIENTS: [string, string][] = [
-  ["#ffd27a", "#a85e00"],
-  ["#ff8f6b", "#8f2415"],
+  ["#d7ff8a", "#4a6b12"],
+  ["#ffb37a", "#7a3d10"],
 ];
 
 const PREDATOR_STATE_STYLE: Record<"patrol" | "chase" | "search", { color: string; glow: string | null }> = {
@@ -74,29 +85,39 @@ function pathStar(ctx: CanvasRenderingContext2D, cx: number, cy: number, outerR:
   ctx.closePath();
 }
 
-function pathBat(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number): void {
+// A giant dragonfly: slender body plus two elongated, swept wing pairs --
+// stands in for the old bat now that tier 0 reads as swamp insect life
+// rather than cave fauna.
+function pathDragonfly(ctx: CanvasRenderingContext2D, cx: number, cy: number, r: number): void {
   const pts: [number, number][] = [
-    [0, -r * 0.5],
-    [r, -r * 0.1],
-    [r * 0.35, r * 0.05],
-    [r * 0.75, r * 0.55],
+    [0, -r * 1.1],
+    [r * 0.18, -r * 0.3],
+    [r * 1.15, -r * 0.65],
+    [r * 0.3, r * 0.05],
+    [r * 0.95, r * 0.75],
     [0, r * 0.35],
-    [-r * 0.75, r * 0.55],
-    [-r * 0.35, r * 0.05],
-    [-r, -r * 0.1],
+    [0, r * 1.1],
+    [-r * 0.95, r * 0.75],
+    [-r * 0.3, r * 0.05],
+    [-r * 1.15, -r * 0.65],
+    [-r * 0.18, -r * 0.3],
   ];
   pathFromPoints(ctx, pts.map(([x, y]): [number, number] => [cx + x, cy + y]));
 }
 
+// An elongated crocodilian silhouette -- long snout forward, tapering tail
+// behind -- replacing the old fish/diamond shape for the swamp predator.
 function predatorLocalPoints(r: number): [number, number][] {
   return [
-    [r * 1.3, 0],
-    [r * 0.6, r * 0.35],
-    [r * 0.1, r * 0.6],
-    [-r * 1.1, r * 0.25],
-    [-r * 1.1, -r * 0.25],
-    [r * 0.1, -r * 0.6],
-    [r * 0.6, -r * 0.35],
+    [r * 1.6, 0],
+    [r * 0.9, r * 0.3],
+    [r * 0.3, r * 0.42],
+    [-r * 0.6, r * 0.3],
+    [-r * 1.5, r * 0.12],
+    [-r * 1.5, -r * 0.12],
+    [-r * 0.6, -r * 0.3],
+    [r * 0.3, -r * 0.42],
+    [r * 0.9, -r * 0.3],
   ];
 }
 
@@ -110,12 +131,46 @@ let bgGradientH = -1;
 function getBackgroundGradient(ctx: CanvasRenderingContext2D, width: number, height: number): CanvasGradient {
   if (bgGradient && bgGradientW === width && bgGradientH === height) return bgGradient;
   const g = ctx.createRadialGradient(width / 2, height / 2, 0, width / 2, height / 2, Math.hypot(width, height) / 2);
-  g.addColorStop(0, "#2a2118");
-  g.addColorStop(1, "#08060a");
+  g.addColorStop(0, "#1c3324");
+  g.addColorStop(1, "#030907");
   bgGradient = g;
   bgGradientW = width;
   bgGradientH = height;
   return g;
+}
+
+// The shrinking safe zone, drawn as ground rather than fog: a translucent
+// murky tint outside the boundary (rect-minus-circle via evenodd fill --
+// paints nothing once the zone still covers the whole map, so no branching
+// is needed for the early part of a round) plus a pulsing dashed ring so the
+// boundary itself is easy to read at a glance.
+function drawSafeZone(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
+  const { width, height } = state;
+  const cx = width / 2;
+  const cy = height / 2;
+  const r = safeZoneRadius(width, height, TIME_LIMIT_S - state.timeLeft);
+
+  // While the zone still reaches every corner it has nothing to tint, but the
+  // evenodd fill below was still rasterizing a full-screen path to paint
+  // nothing -- which is the entire first third of every round.
+  const coversMap = r >= Math.hypot(width, height) / 2;
+  if (!coversMap) {
+    ctx.beginPath();
+    ctx.rect(0, 0, width, height);
+    ctx.moveTo(cx + r, cy);
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(20,45,15,0.55)";
+    ctx.fill("evenodd");
+  }
+
+  const pulse = 0.5 + Math.sin(clockSeconds * 2) * 0.15;
+  ctx.setLineDash([10, 8]);
+  ctx.strokeStyle = `rgba(140,220,90,${pulse})`;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
 }
 
 export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
@@ -123,6 +178,7 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSec
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = getBackgroundGradient(ctx, width, height);
   ctx.fillRect(0, 0, width, height);
+  drawSafeZone(ctx, state, clockSeconds);
 
   drawGrass(ctx, state, clockSeconds);
   drawWalls(ctx, state, clockSeconds);
@@ -133,11 +189,11 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSec
   for (const hazard of state.hazards) {
     drawHazard(ctx, state, hazard, pulse);
   }
-  if (state.predator) {
-    drawPredator(ctx, state, state.predator, pulse);
+  for (const predator of state.predators) {
+    drawPredator(ctx, state, predator, pulse);
   }
 
-  drawPlayer(ctx, state);
+  drawPlayer(ctx, state, isOutsideSafeZone(state));
   drawGrowthMeter(ctx, state);
   drawTimer(ctx, state);
   drawBuffBadge(ctx, state.invincibleTimeLeft, INVINCIBLE_DURATION, 0, PLAYER_COLOR);
@@ -148,105 +204,186 @@ export function render(ctx: CanvasRenderingContext2D, state: GameState, clockSec
   }
 }
 
-// shadowBlur/shadowColor are persistent context state -- they leak onto
-// whatever's drawn next unless reset immediately after the call that wants
-// them, so every glow below is set right before its fill/stroke and cleared
-// right after. Reserved for the small, bounded entity counts (player,
-// hazards, predator, power-ups, the gate-gap crystal clusters, the timer
-// arc); the ~30 food shards get their glow via a gradient that fades to
-// transparent instead, since a real shadowBlur pass on that many shapes
-// every frame isn't worth the cost.
-
-// A jagged silhouette along a wall's top and bottom edges, offset
-// deterministically from its own x/y/w/h -- never Math.random(), or the rock
-// face would jitter every frame instead of holding still like actual stone.
-// The left/right (end) edges stay a clean straight cut: jagging them too
-// reads fine when a cluster has exactly one far-apart gap, but once a
-// cluster can hold a second, closer gap (see makeClusterSpan in game.ts),
-// two jagged ends a short segment apart -- each already carrying its own
-// vine cluster -- crowd into spiky, overlapping-looking clutter instead of
-// an opening.
-function rockRidgePath(ctx: CanvasRenderingContext2D, wall: GameState["walls"][number]): void {
-  const { x, y, w, h } = wall;
-  const ampH = 6;
-  const nH = Math.max(2, Math.round(w / 16));
-  const topJag = (i: number) => (seededRand(x * 0.17 + y * 0.31 + i * 2.7) - 0.5) * 2 * ampH;
-  const botJag = (i: number) => (seededRand(x * 0.53 + y * 0.11 + i * 4.3 + 99) - 0.5) * 2 * ampH;
-
+// A jagged silhouette around a boulder's circle, offset deterministically
+// from its own position -- never Math.random(), or the rock face would
+// jitter every frame instead of holding still like actual stone.
+function boulderRockPath(ctx: CanvasRenderingContext2D, wall: GameState["walls"][number]): void {
+  const { x, y } = wall.pos;
+  const r = wall.radius;
+  const sides = 10;
+  const amp = r * 0.22;
   ctx.beginPath();
-  ctx.moveTo(x, y);
-  for (let i = 1; i <= nH; i++) ctx.lineTo(x + (w * i) / nH, y + topJag(i));
-  ctx.lineTo(x + w, y + h);
-  for (let i = nH - 1; i >= 0; i--) ctx.lineTo(x + (w * i) / nH, y + h + botJag(i));
+  for (let i = 0; i < sides; i++) {
+    const angle = (Math.PI * 2 * i) / sides;
+    const jag = (seededRand(x * 0.31 + y * 0.17 + i * 3.1) - 0.5) * 2 * amp;
+    const rr = r + jag;
+    const px = x + Math.cos(angle) * rr;
+    const py = y + Math.sin(angle) * rr;
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
   ctx.closePath();
+}
+
+// Every `shadowBlur` draw makes Skia allocate an offscreen layer, run a
+// multi-pass gaussian over it and composite the result -- the per-call setup
+// dominates, so the cost is about how *many* you do, not how big they are.
+// The scene was issuing 15-25 a frame (up to 8 hazards, both predators, the
+// player, the HUD, and one per floating score number, which alone can hit 40
+// mid-combo). These stamp a pre-rendered radial glow instead: one cached
+// sprite per colour, then a plain blit.
+const GLOW_SPRITE_R = 32;
+const glowSprites = new Map<string, HTMLCanvasElement>();
+
+function withAlpha(hex: string, alpha: number): string {
+  const r = parseInt(hex.slice(1, 3), 16);
+  const g = parseInt(hex.slice(3, 5), 16);
+  const b = parseInt(hex.slice(5, 7), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
+function getGlowSprite(color: string): HTMLCanvasElement {
+  const cached = glowSprites.get(color);
+  if (cached) return cached;
+  const canvas = document.createElement("canvas");
+  canvas.width = GLOW_SPRITE_R * 2;
+  canvas.height = GLOW_SPRITE_R * 2;
+  const gctx = canvas.getContext("2d")!;
+  const g = gctx.createRadialGradient(
+    GLOW_SPRITE_R,
+    GLOW_SPRITE_R,
+    0,
+    GLOW_SPRITE_R,
+    GLOW_SPRITE_R,
+    GLOW_SPRITE_R,
+  );
+  g.addColorStop(0, withAlpha(color, 0.62));
+  g.addColorStop(0.4, withAlpha(color, 0.3));
+  g.addColorStop(1, withAlpha(color, 0));
+  gctx.fillStyle = g;
+  gctx.fillRect(0, 0, GLOW_SPRITE_R * 2, GLOW_SPRITE_R * 2);
+  glowSprites.set(color, canvas);
+  return canvas;
+}
+
+/** Stamps a soft halo of `color` centred on (x, y), reaching out to `radius`. */
+function stampGlow(ctx: CanvasRenderingContext2D, color: string, x: number, y: number, radius: number): void {
+  ctx.drawImage(getGlowSprite(color), x - radius, y - radius, radius * 2, radius * 2);
+}
+
+// A glowing spore tip, drawn once into a tiny canvas and stamped wherever one
+// is needed. The sprite is drawn larger than the solid core so it carries the
+// falloff the old shadowBlur provided -- hence the scale factor callers apply.
+const SPORE_SPRITE_SCALE = 3.2;
+let sporeSprite: HTMLCanvasElement | null = null;
+
+function getSporeSprite(): HTMLCanvasElement {
+  if (sporeSprite) return sporeSprite;
+  const r = 24;
+  const canvas = document.createElement("canvas");
+  canvas.width = r * 2;
+  canvas.height = r * 2;
+  const sctx = canvas.getContext("2d")!;
+  const g = sctx.createRadialGradient(r, r, 0, r, r, r);
+  g.addColorStop(0, "#f2ffd4");
+  g.addColorStop(0.28, SPORE_COLOR);
+  g.addColorStop(1, "rgba(200,255,110,0)");
+  sctx.fillStyle = g;
+  sctx.fillRect(0, 0, r * 2, r * 2);
+  sporeSprite = canvas;
+  return canvas;
 }
 
 // A small tangle of curling vine strands reaching from a gap's rock edge into
 // the opening -- replaces a flat, two-line-bounded gap marker with something
-// that reads as overgrown and irregular. `dir` is which way the strand curls:
-// +1 for the edge on the gap's left (curling right), -1 for the right (curling
-// left). Glowing berry tips keep the same crystal-glow language as the rest
-// of the cave without the shape reading as another crystal cluster.
+// that reads as overgrown and irregular. `angle` points from the edge into
+// the gap (so vines from the two boulders bounding a gap curl toward each
+// other); `spread` is how far along the perpendicular the strands' start
+// points scatter. Glowing spore tips keep the bioluminescent language of the
+// rest of the swamp without the shape reading as a crystal cluster.
 function drawGapVines(
   ctx: CanvasRenderingContext2D,
   ex: number,
-  cy: number,
-  halfHeight: number,
-  dir: 1 | -1,
+  ey: number,
+  angle: number,
+  spread: number,
   seedBase: number,
   clockSeconds: number,
 ): void {
+  const dx = Math.cos(angle);
+  const dy = Math.sin(angle);
+  const px = -dy;
+  const py = dx;
   ctx.lineCap = "round";
   for (let i = 0; i < 4; i++) {
     const seed = seedBase + i * 7.3;
-    const startY = cy + (seededRand(seed) - 0.5) * halfHeight * 1.8;
-    const reach = (10 + seededRand(seed + 1) * 14) * dir;
+    const along = (seededRand(seed) - 0.5) * spread * 1.8;
+    const startX = ex + px * along;
+    const startY = ey + py * along;
+    const reach = 10 + seededRand(seed + 1) * 14;
     const sway = Math.sin(clockSeconds * 1.3 + seed) * 4;
-    const midX = ex + reach * 0.55 + sway;
-    const midY = startY + (seededRand(seed + 2) - 0.5) * 18;
-    const endX = ex + reach + sway * 0.6;
-    const endY = startY + (seededRand(seed + 3) - 0.5) * 24;
+    const midJitter = (seededRand(seed + 2) - 0.5) * 18;
+    const endJitter = (seededRand(seed + 3) - 0.5) * 24;
+    const midX = startX + dx * reach * 0.55 + px * (sway + midJitter);
+    const midY = startY + dy * reach * 0.55 + py * (sway + midJitter);
+    const endX = startX + dx * reach + px * (sway * 0.6 + endJitter);
+    const endY = startY + dy * reach + py * (sway * 0.6 + endJitter);
 
     ctx.strokeStyle = `rgba(110,170,90,${0.5 + seededRand(seed + 4) * 0.3})`;
     ctx.lineWidth = 1.5 + seededRand(seed + 5) * 1.5;
     ctx.beginPath();
-    ctx.moveTo(ex, startY);
+    ctx.moveTo(startX, startY);
     ctx.quadraticCurveTo(midX, midY, endX, endY);
     ctx.stroke();
 
-    ctx.fillStyle = CRYSTAL_COLOR;
-    ctx.shadowColor = CRYSTAL_COLOR;
-    ctx.shadowBlur = 6;
-    ctx.beginPath();
-    ctx.arc(endX, endY, 2 + seededRand(seed + 6) * 1.5, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.shadowBlur = 0;
+    // Was a shadowBlur'd arc. With one or two gaps per cluster and four
+    // strands on each side of every gap, that came to ~100 full gaussian
+    // blur passes a frame -- the single most expensive thing in the scene.
+    // A pre-rendered glow sprite is the same picture for the cost of a blit.
+    const tip = getSporeSprite();
+    const tipR = (2 + seededRand(seed + 6) * 1.5) * SPORE_SPRITE_SCALE;
+    ctx.drawImage(tip, endX - tipR, endY - tipR, tipR * 2, tipR * 2);
   }
   ctx.lineCap = "butt";
 }
 
+// Deliberately NOT cached into an offscreen layer, despite the boulders being
+// static for the whole round. That was tried and measured worse: ~105
+// boulders of radius 9-15 cover roughly 100k device pixels between them,
+// while blitting a prebaked full-canvas layer costs a 4.7M-pixel alpha
+// composite -- about 44x more pixels than the thing it was avoiding. Caching
+// static geometry only pays when the geometry covers most of the screen.
 function drawWalls(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
   for (const wall of state.walls) {
-    const g = ctx.createLinearGradient(0, wall.y, 0, wall.y + wall.h);
-    g.addColorStop(0, "#4a3b2a");
-    g.addColorStop(1, "#1a140d");
+    const g = ctx.createRadialGradient(
+      wall.pos.x - wall.radius * 0.3,
+      wall.pos.y - wall.radius * 0.3,
+      0,
+      wall.pos.x,
+      wall.pos.y,
+      wall.radius * 1.3,
+    );
+    g.addColorStop(0, "#5c6e46");
+    g.addColorStop(1, "#12180d");
     ctx.fillStyle = g;
-    rockRidgePath(ctx, wall);
+    boulderRockPath(ctx, wall);
     ctx.fill();
 
-    ctx.strokeStyle = "rgba(200,160,110,0.4)";
+    ctx.strokeStyle = "rgba(170,200,120,0.4)";
     ctx.lineWidth = 2;
     ctx.stroke();
   }
 
-  // Mark the inner edges of every gap in each cluster -- derived straight
-  // from the wall rects, no extra state -- so each opening reads at a
-  // glance. Grouped by clusterId rather than exact y: boulders within a
-  // cluster are y-jittered so it reads as an uneven pile, not a straight
-  // bar, so segments in the same cluster no longer share one y. A cluster
-  // can hold more than one gap, so this walks consecutive segments left to
-  // right instead of assuming exactly two, and each gap edge's vertical
-  // center comes from that segment's own y/h rather than a shared row y.
+  // Mark every real gap in each cluster with a tangle of vines -- derived
+  // straight from the boulders' own positions, no extra state -- so each
+  // opening reads at a glance. Grouped by clusterId and walked in path
+  // order (pathIndex), not raw x/y: a cluster's path can now curve, zigzag,
+  // or loop, so sorting by position no longer finds true neighbours.
+  // Consecutive boulders sit close together by construction, so a much
+  // bigger separation than normal placement jitter is a real gap. Closed
+  // ("blob" ring) clusters also check the wrap-around pair (last back to
+  // first); open clusters' first/last boulders are the two unconnected
+  // ends, not a gap, so that pair is skipped for them.
   const byCluster = new Map<number, typeof state.walls>();
   for (const wall of state.walls) {
     const cluster = byCluster.get(wall.clusterId) ?? [];
@@ -255,30 +392,48 @@ function drawWalls(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds
   }
   for (const segments of byCluster.values()) {
     if (segments.length < 2) continue;
-    const sorted = [...segments].sort((a, b) => a.x - b.x);
-    for (let i = 0; i < sorted.length - 1; i++) {
-      const left = sorted[i];
-      const right = sorted[i + 1];
-      const leftCy = left.y + left.h / 2;
-      const rightCy = right.y + right.h / 2;
-      const halfHeight = left.h / 2 + 14;
-      drawGapVines(ctx, left.x + left.w, leftCy, halfHeight, 1, (left.x + left.w) * 0.7 + leftCy * 0.31, clockSeconds);
-      drawGapVines(ctx, right.x, rightCy, halfHeight, -1, right.x * 0.7 + rightCy * 0.31, clockSeconds);
+    const sorted = [...segments].sort((a, b) => a.pathIndex - b.pathIndex);
+    const pairs: [(typeof sorted)[number], (typeof sorted)[number]][] = [];
+    for (let i = 0; i < sorted.length - 1; i++) pairs.push([sorted[i], sorted[i + 1]]);
+    if (sorted[0].closed) pairs.push([sorted[sorted.length - 1], sorted[0]]);
+
+    for (const [a, b] of pairs) {
+      const dx = b.pos.x - a.pos.x;
+      const dy = b.pos.y - a.pos.y;
+      const centerDist = Math.hypot(dx, dy);
+      const gapDist = centerDist - a.radius - b.radius;
+      if (gapDist < 24) continue;
+      const angle = Math.atan2(dy, dx);
+      const spread = Math.max(a.radius, b.radius) + 10;
+      const seedA = a.pos.x * 0.7 + a.pos.y * 0.31;
+      const seedB = b.pos.x * 0.7 + b.pos.y * 0.31;
+      drawGapVines(ctx, a.pos.x + Math.cos(angle) * a.radius, a.pos.y + Math.sin(angle) * a.radius, angle, spread, seedA, clockSeconds);
+      drawGapVines(ctx, b.pos.x - Math.cos(angle) * b.radius, b.pos.y - Math.sin(angle) * b.radius, angle + Math.PI, spread, seedB, clockSeconds);
     }
   }
 }
 
+// Every pellet shares one radius, so it can share one gradient too -- built
+// at the origin and moved under the context rather than rebuilt 30 times a
+// frame at each pellet's coordinates.
+let foodGradient: CanvasGradient | null = null;
+
 function drawFood(ctx: CanvasRenderingContext2D, state: GameState): void {
+  const r = FOOD_RADIUS * 1.8;
+  if (!foodGradient) {
+    foodGradient = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+    foodGradient.addColorStop(0, "#f5ffd0");
+    foodGradient.addColorStop(0.5, FOOD_COLOR);
+    foodGradient.addColorStop(1, "rgba(200,255,110,0)");
+  }
+  ctx.fillStyle = foodGradient;
   for (const food of state.food) {
-    const r = food.radius * 1.8;
-    const g = ctx.createRadialGradient(food.pos.x, food.pos.y, 0, food.pos.x, food.pos.y, r);
-    g.addColorStop(0, "#fff6d0");
-    g.addColorStop(0.5, FOOD_COLOR);
-    g.addColorStop(1, "rgba(255,233,138,0)");
-    ctx.fillStyle = g;
     const rotation = seededRand(food.pos.x * 0.11 + food.pos.y * 0.07) * Math.PI * 2;
-    pathFromPoints(ctx, localToWorld(food.pos.x, food.pos.y, rotation, crystalShardPoints(r)));
+    ctx.save();
+    ctx.translate(food.pos.x, food.pos.y);
+    pathFromPoints(ctx, localToWorld(0, 0, rotation, crystalShardPoints(r)));
     ctx.fill();
+    ctx.restore();
   }
 }
 
@@ -305,17 +460,14 @@ function drawHazard(
   g.addColorStop(1, rim);
   ctx.fillStyle = g;
 
-  if (!crushable) {
-    ctx.shadowColor = "rgba(255,45,77,0.85)";
-    ctx.shadowBlur = 16;
-  }
+  if (!crushable) stampGlow(ctx, DANGER_COLOR, hazard.pos.x, hazard.pos.y, r * 2.1);
+  ctx.fillStyle = g;
   if (hazard.tier === 0) {
-    pathBat(ctx, hazard.pos.x, hazard.pos.y, r);
+    pathDragonfly(ctx, hazard.pos.x, hazard.pos.y, r);
   } else {
     pathStar(ctx, hazard.pos.x, hazard.pos.y, r * 1.1, r * 0.5, 9);
   }
   ctx.fill();
-  ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 
   if (crushable) {
@@ -330,7 +482,7 @@ function drawHazard(
 function drawPredator(
   ctx: CanvasRenderingContext2D,
   state: GameState,
-  predator: NonNullable<GameState["predator"]>,
+  predator: Predator,
   pulse: number,
 ): void {
   const crushable = state.player.radius >= predator.radius * CRUSH_RATIO;
@@ -359,12 +511,11 @@ function drawPredator(
   ctx.fillStyle = g;
 
   if (!crushable && style.glow) {
-    ctx.shadowColor = style.glow;
-    ctx.shadowBlur = predator.state === "chase" ? 20 : 12;
+    stampGlow(ctx, style.glow, predator.pos.x, predator.pos.y, r * (predator.state === "chase" ? 2.3 : 1.9));
+    ctx.fillStyle = g;
   }
   pathFromPoints(ctx, localToWorld(predator.pos.x, predator.pos.y, angle, predatorLocalPoints(r)));
   ctx.fill();
-  ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 
   if (crushable) {
@@ -380,6 +531,14 @@ function drawGrass(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds
   for (let gi = 0; gi < state.grass.length; gi++) {
     const { pos, radius } = state.grass[gi];
 
+    const fill = ctx.createRadialGradient(pos.x, pos.y, 0, pos.x, pos.y, radius);
+    fill.addColorStop(0, "rgba(60,100,50,0.28)");
+    fill.addColorStop(1, "rgba(60,100,50,0)");
+    ctx.fillStyle = fill;
+    ctx.beginPath();
+    ctx.ellipse(pos.x, pos.y, radius, radius * 0.7, 0, 0, Math.PI * 2);
+    ctx.fill();
+
     ctx.setLineDash([4, 6]);
     ctx.strokeStyle = "rgba(150,200,120,0.25)";
     ctx.lineWidth = 1;
@@ -388,16 +547,16 @@ function drawGrass(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const blades = 9;
-    ctx.strokeStyle = "rgba(110,170,90,0.55)";
+    const blades = 14;
+    ctx.strokeStyle = "rgba(110,170,90,0.6)";
     ctx.lineWidth = 3;
     for (let i = 0; i < blades; i++) {
       const seed = gi * 13.7 + i * 4.1;
       const angle = (Math.PI * 2 * i) / blades + seededRand(seed) * 0.6;
-      const bx = pos.x + Math.cos(angle) * radius * 0.7 * seededRand(seed + 1);
-      const by = pos.y + Math.sin(angle) * radius * 0.5 * seededRand(seed + 2);
+      const bx = pos.x + Math.cos(angle) * radius * 0.75 * seededRand(seed + 1);
+      const by = pos.y + Math.sin(angle) * radius * 0.55 * seededRand(seed + 2);
       const sway = Math.sin(clockSeconds * 2 + gi + i) * 6;
-      const bladeH = 18 + seededRand(seed + 3) * 14;
+      const bladeH = 22 + seededRand(seed + 3) * 18;
 
       ctx.beginPath();
       ctx.moveTo(bx, by);
@@ -472,8 +631,9 @@ function drawBuffBadge(
   ctx.shadowBlur = 0;
 }
 
-function drawPlayer(ctx: CanvasRenderingContext2D, state: GameState): void {
+function drawPlayer(ctx: CanvasRenderingContext2D, state: GameState, inDanger: boolean): void {
   const { pos, radius } = state.player;
+  const glowColor = inDanger ? DANGER_COLOR : PLAYER_COLOR;
   const g = ctx.createRadialGradient(
     pos.x - radius * 0.3,
     pos.y - radius * 0.3,
@@ -482,16 +642,14 @@ function drawPlayer(ctx: CanvasRenderingContext2D, state: GameState): void {
     pos.y,
     radius,
   );
-  g.addColorStop(0, "#e8fff5");
-  g.addColorStop(0.55, PLAYER_COLOR);
-  g.addColorStop(1, "#1a6e54");
+  g.addColorStop(0, inDanger ? "#fff0e8" : "#e8fff5");
+  g.addColorStop(0.55, glowColor);
+  g.addColorStop(1, inDanger ? "#5a1a12" : "#1a6e54");
+  stampGlow(ctx, glowColor, pos.x, pos.y, radius * 2.4);
   ctx.fillStyle = g;
-  ctx.shadowColor = PLAYER_COLOR;
-  ctx.shadowBlur = 24;
   ctx.beginPath();
   ctx.arc(pos.x, pos.y, radius, 0, Math.PI * 2);
   ctx.fill();
-  ctx.shadowBlur = 0;
 }
 
 function drawGrowthMeter(ctx: CanvasRenderingContext2D, state: GameState): void {

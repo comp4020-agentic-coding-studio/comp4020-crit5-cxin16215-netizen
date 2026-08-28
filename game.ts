@@ -23,16 +23,22 @@ export interface Hazard {
   tier: number;
 }
 
-export interface WallRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  // Which scattered rock cluster this segment belongs to -- render.ts groups
-  // by this (not by exact y) to find each cluster's internal gap(s), since
-  // boulders within one cluster are no longer pinned to a shared y (see
-  // makeCluster's jitter, below).
+export interface Boulder {
+  pos: Vec2;
+  radius: number;
+  // Which scattered rock cluster this boulder belongs to -- render.ts groups
+  // by this (not by position) to find each cluster's internal gap(s).
   clusterId: number;
+  // Generation order along the cluster's path. render.ts sorts by this
+  // (rather than by raw x/y) to walk a cluster boulder-by-boulder when
+  // looking for gaps, since a cluster's path can curve, zigzag, or loop and
+  // is no longer guaranteed to be x-monotonic.
+  pathIndex: number;
+  // Whether this cluster's path is a closed loop (a "blob" ring) rather than
+  // an open curve -- render.ts needs this to know whether the highest and
+  // lowest pathIndex boulders are actually adjacent (and so may bound a real
+  // gap) or are just the two open ends of a line/arc/zigzag.
+  closed: boolean;
 }
 
 export type PredatorState = "patrol" | "chase" | "search";
@@ -68,9 +74,10 @@ export interface GameState {
   player: Player;
   food: Food[];
   hazards: Hazard[];
-  walls: WallRect[];
+  walls: Boulder[];
   dangerBands: [number, number];
-  predator: Predator | null;
+  predators: Predator[];
+  secondPredatorSpawned: boolean;
   grass: Grass[];
   powerUps: PowerUp[];
   invincibleTimeLeft: number;
@@ -86,21 +93,27 @@ export const WIN_RADIUS = 46;
 export const TIME_LIMIT_S = 60;
 // How much bigger than a hazard the player must be to crush it instead of
 // dying to it. Tune this by playing: raise it and small hazards stay
-// dangerous longer; lower it and growth pays off sooner.
-export const CRUSH_RATIO = 1.15;
+// dangerous longer; lower it and growth pays off sooner. Raised from the
+// original 1.15 -- at that ratio the smallest hazard tier was crushable
+// after only ~2 food, which meant most of a round had no real hazard danger
+// left. Paired with the bigger HAZARD_TIERS radii below so the predator
+// (radius 34, unchanged) stays crushable near the very end rather than
+// becoming permanently invincible.
+export const CRUSH_RATIO = 1.3;
 export const FOOD_RADIUS = 4;
 export const FOOD_GROWTH = 1.3;
 export const FOOD_COUNT = 30;
 export const FOLLOW_EASE = 7;
 export const GATE_GAP = 80;
-export const GATE_THICKNESS = 16;
 export const HAZARDS_PER_TIER = 4;
 
 // Tier 2 (the old biggest/deadliest static hazard) is now the predator
-// below -- only the two weaker, static tiers stay here.
+// below -- only the two weaker, static tiers stay here. Radii raised
+// alongside CRUSH_RATIO (see above) so both the crush threshold and the raw
+// size of a hazard make it harder to shrug off early.
 export const HAZARD_TIERS: { radius: number; color: string }[] = [
-  { radius: 10, color: "#f5a623" },
-  { radius: 20, color: "#e8543f" },
+  { radius: 13, color: "#f5a623" },
+  { radius: 27, color: "#e8543f" },
 ];
 
 export const PREDATOR_RADIUS = 34;
@@ -109,6 +122,21 @@ export const PREDATOR_LOSE_RADIUS = 320;
 export const PREDATOR_PATROL_SPEED = 60;
 export const PREDATOR_CHASE_SPEED = 130;
 export const PREDATOR_SEARCH_TIME = 3;
+// A second hunter joins partway through the round -- picked so it lands
+// after the safe zone has already started closing in (see below), stacking
+// two escalation points instead of one.
+export const SECOND_PREDATOR_SPAWN_S = 28;
+
+// A shrinking safe zone around the map center: harmless at first, then
+// closes in from SHRINK_START to SHRINK_END (elapsed round seconds),
+// punishing the player for camping far from center in the back half of a
+// round. Values chosen so the zone starts closing before the second
+// predator arrives, and bottoms out a few seconds before the round ends.
+export const SAFE_ZONE_SHRINK_START_S = 20;
+export const SAFE_ZONE_SHRINK_END_S = 55;
+export const SAFE_ZONE_MIN_FRACTION = 0.32;
+export const SAFE_ZONE_DRAIN_PER_S = 2.5;
+export const MIN_SURVIVABLE_RADIUS = 3;
 
 export const GRASS_COUNT = 7;
 export const GRASS_RADIUS = 55;
@@ -158,10 +186,8 @@ function farEnough(pos: Vec2, others: { pos: Vec2; radius: number }[], minGap: n
   return others.every((o) => dist(pos, o.pos) > o.radius + minGap);
 }
 
-function insideAnyWall(pos: Vec2, radius: number, walls: WallRect[]): boolean {
-  return walls.some(
-    (w) => pos.x + radius > w.x && pos.x - radius < w.x + w.w && pos.y + radius > w.y && pos.y - radius < w.y + w.h,
-  );
+function insideAnyWall(pos: Vec2, radius: number, walls: Boulder[]): boolean {
+  return walls.some((w) => dist(pos, w.pos) < w.radius + radius);
 }
 
 function placeAvoiding(
@@ -172,7 +198,7 @@ function placeAvoiding(
   minGap: number,
   attempts = 40,
   yRange?: YRange,
-  walls: WallRect[] = [],
+  walls: Boulder[] = [],
 ): Vec2 {
   for (let i = 0; i < attempts; i++) {
     const p = randomPoint(width, height, radius + 10, yRange);
@@ -184,61 +210,165 @@ function placeAvoiding(
 const CLUSTER_COUNT = 7;
 const CLUSTER_MIN_SPAN = 220;
 const CLUSTER_MAX_SPAN = 380;
-// The minimum wall chunk width -- at a cluster's outer edges and between two
-// gaps in the same cluster -- scales with the cluster's own span rather than
-// a flat constant: reusing one fixed margin at both a 220px and a 380px span
-// would either starve the small end of any room or (worse) make a second gap
-// on the small end nearly impossible to find via rejection sampling, quietly
-// killing the "sometimes two gaps" variety this exists to offer.
-const CLUSTER_MIN_SEGMENT_FLOOR = 25;
-const CLUSTER_MIN_SEGMENT_RATIO = 0.1;
-// Boulders within one cluster are offset from a shared centerline by up to
-// this much so the cluster reads as an uneven rock pile, not a short
-// straight bar -- the ask that "obstacles shouldn't be confined to straight
-// lines" applies at the single-cluster scale too, not just to how clusters
-// are scattered across the map.
-const CLUSTER_BOULDER_Y_JITTER = 14;
+// Per-boulder radius range. Varying it (rather than one fixed thickness) is
+// part of what makes even a "line" cluster read as an uneven rock pile
+// instead of a ruler-straight bar.
+const CLUSTER_BOULDER_RADIUS_MIN = 9;
+const CLUSTER_BOULDER_RADIUS_MAX = 15;
+// Extra isotropic jitter applied to every boulder's placement along its
+// path -- the "hand-scattered, not a perfect curve" touch, now shape-
+// agnostic since it's no longer tied to a single shared centerline.
+const CLUSTER_BOULDER_JITTER = 6;
 
-// One cluster's wall segments along a local [0, span] axis, not yet placed
-// in the world. Usually a single gap, but sometimes two -- two gaps in the
-// same cluster give the player an actual route choice (the closer one vs.
-// the one that swings wider of a hazard band) instead of a single forced
-// funnel. Every gap stays exactly GATE_GAP wide regardless of count.
-function makeClusterSpan(span: number, minSegment: number): WallRect[] {
-  const spacing = GATE_GAP + minSegment;
-  const maxGapsThatFit = Math.floor((span - minSegment) / spacing);
-  const gapCount = Math.max(1, Math.min(maxGapsThatFit, Math.random() < 0.6 ? 1 : 2));
+type ClusterShape = "line" | "arc" | "zigzag" | "blob";
 
-  const gapStarts: number[] = [];
-  let attempts = 0;
-  while (gapStarts.length < gapCount && attempts < 200) {
-    attempts++;
-    const candidate = minSegment + Math.random() * Math.max(1, span - GATE_GAP - minSegment * 2);
-    if (gapStarts.every((g) => Math.abs(g - candidate) >= spacing)) gapStarts.push(candidate);
-  }
-  gapStarts.sort((a, b) => a - b);
-
-  const rects: Omit<WallRect, "clusterId">[] = [];
-  let cursor = 0;
-  for (const gapX of gapStarts) {
-    rects.push({ x: cursor, y: -GATE_THICKNESS / 2, w: Math.max(gapX - cursor, 0), h: GATE_THICKNESS });
-    cursor = gapX + GATE_GAP;
-  }
-  rects.push({ x: cursor, y: -GATE_THICKNESS / 2, w: Math.max(span - cursor, 0), h: GATE_THICKNESS });
-  return rects as WallRect[];
+// Weighted so straight-ish clusters still turn up sometimes, but most
+// clusters now read as something other than a bar -- this is the direct
+// answer to "obstacles shouldn't be confined to straight lines."
+function pickClusterShape(): ClusterShape {
+  const r = Math.random();
+  if (r < 0.3) return "line";
+  if (r < 0.55) return "arc";
+  if (r < 0.75) return "zigzag";
+  return "blob";
 }
 
-// One independent rock cluster, placed and jittered into world space. Unlike
+// A cluster's local-space (unrotated, uncentered) curve: `point(t)` for
+// t in [0,1). `closed` clusters (the "blob" ring) treat t=0 and t=1 as
+// adjacent, so their gap-search and boulder-walk wrap around instead of
+// stopping at two open ends.
+interface ShapePath {
+  point(t: number): Vec2;
+  count: number;
+  closed: boolean;
+}
+
+function makeShapePath(shape: ClusterShape, span: number): ShapePath {
+  const spacing = (CLUSTER_BOULDER_RADIUS_MIN + CLUSTER_BOULDER_RADIUS_MAX) * 0.7;
+  const count = Math.max(8, Math.round(span / spacing));
+
+  if (shape === "blob") {
+    // A broken ring: circumference == span, so the same GATE_GAP-wide-gap
+    // logic below reads as one or two openings in the ring instead of a cut
+    // in a bar. Wobble is a couple of fixed-phase sine harmonics (chosen
+    // once per cluster, not per point) so the ring stays a smooth lumpy
+    // blob instead of a noisy, hard-to-navigate silhouette.
+    const radius = span / (2 * Math.PI);
+    const wobbleAmp = 0.12 + Math.random() * 0.1;
+    const wobbleFreq = 2 + Math.floor(Math.random() * 2);
+    const wobblePhase = Math.random() * Math.PI * 2;
+    return {
+      count: Math.max(10, count),
+      closed: true,
+      point: (t) => {
+        const angle = t * Math.PI * 2;
+        const r = radius * (1 + wobbleAmp * Math.sin(angle * wobbleFreq + wobblePhase));
+        return { x: Math.cos(angle) * r, y: Math.sin(angle) * r * 0.75 };
+      },
+    };
+  }
+
+  if (shape === "arc") {
+    // A crescent: radius (and so curvature) varies per cluster between a
+    // tight bend and a nearly-straight sweep.
+    const radius = span * (0.6 + Math.random() * 0.6);
+    const theta = span / radius;
+    return {
+      count,
+      closed: false,
+      point: (t) => {
+        const angle = (t - 0.5) * theta;
+        return {
+          x: radius * Math.sin(angle),
+          y: radius * (1 - Math.cos(angle)) - radius * (1 - Math.cos(theta / 2)),
+        };
+      },
+    };
+  }
+
+  if (shape === "zigzag") {
+    // A lightning-bolt ridge: a triangle wave across 2-4 segments.
+    const segments = 2 + Math.floor(Math.random() * 3);
+    const amp = span * 0.09;
+    return {
+      count,
+      closed: false,
+      point: (t) => {
+        const local = (t * segments) % 1;
+        return { x: (t - 0.5) * span, y: (1 - 4 * Math.abs(local - 0.5)) * amp };
+      },
+    };
+  }
+
+  return {
+    count,
+    closed: false,
+    point: (t) => ({ x: (t - 0.5) * span, y: 0 }),
+  };
+}
+
+interface LocalBoulder {
+  x: number;
+  y: number;
+  radius: number;
+  pathIndex: number;
+}
+
+// Walks a cluster's shape path and places a boulder at every step outside
+// its gap window(s) -- usually one gap, but sometimes two, giving the
+// player an actual route choice instead of a single forced funnel. Every
+// gap stays exactly GATE_GAP wide (in arc-length) regardless of shape.
+function makeClusterBoulders(shape: ClusterShape, span: number): LocalBoulder[] {
+  const path = makeShapePath(shape, span);
+  const gapFrac = Math.min(0.35, GATE_GAP / span);
+  const wantsTwoGaps = Math.random() >= 0.6 && gapFrac * 2 + 0.15 < 1;
+  const gapCount = wantsTwoGaps ? 2 : 1;
+
+  const gapCenters: number[] = [];
+  let attempts = 0;
+  while (gapCenters.length < gapCount && attempts < 200) {
+    attempts++;
+    const candidate = gapFrac / 2 + Math.random() * Math.max(0.01, 1 - gapFrac);
+    if (gapCenters.every((g) => Math.abs(g - candidate) >= gapFrac + 0.12)) gapCenters.push(candidate);
+  }
+
+  const inGap = (t: number) =>
+    gapCenters.some((g) => {
+      const raw = Math.abs(t - g);
+      const d = path.closed ? Math.min(raw, 1 - raw) : raw;
+      return d < gapFrac / 2;
+    });
+
+  const boulders: LocalBoulder[] = [];
+  for (let i = 0; i < path.count; i++) {
+    const t = path.closed ? i / path.count : i / (path.count - 1);
+    if (inGap(t)) continue;
+    const { x, y } = path.point(t);
+    boulders.push({
+      x: x + (Math.random() - 0.5) * 2 * CLUSTER_BOULDER_JITTER,
+      y: y + (Math.random() - 0.5) * 2 * CLUSTER_BOULDER_JITTER,
+      radius: CLUSTER_BOULDER_RADIUS_MIN + Math.random() * (CLUSTER_BOULDER_RADIUS_MAX - CLUSTER_BOULDER_RADIUS_MIN),
+      pathIndex: boulders.length,
+    });
+  }
+  return boulders;
+}
+
+// One independent rock cluster, placed and rotated into world space. Unlike
 // the old full-width gate rows, a cluster never spans the whole map -- the
 // player routes around it or threads its gap(s) by choice, never through a
-// forced chokepoint.
-function makeCluster(cx: number, cy: number, span: number, clusterId: number): WallRect[] {
-  const minSegment = Math.max(CLUSTER_MIN_SEGMENT_FLOOR, span * CLUSTER_MIN_SEGMENT_RATIO);
-  return makeClusterSpan(span, minSegment).map((r) => ({
-    ...r,
-    x: r.x + cx - span / 2,
-    y: r.y + cy + (Math.random() - 0.5) * 2 * CLUSTER_BOULDER_Y_JITTER,
+// forced chokepoint. The random rotation means even a "line" or "arc"
+// cluster isn't always lying flat the way every cluster used to.
+function makeCluster(cx: number, cy: number, span: number, clusterId: number, shape: ClusterShape): Boulder[] {
+  const angle = Math.random() * Math.PI * 2;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  return makeClusterBoulders(shape, span).map((b) => ({
+    pos: { x: cx + b.x * cos - b.y * sin, y: cy + b.x * sin + b.y * cos },
+    radius: b.radius,
     clusterId,
+    pathIndex: b.pathIndex,
+    closed: shape === "blob",
   }));
 }
 
@@ -247,14 +377,19 @@ function makeCluster(cx: number, cy: number, span: number, clusterId: number): W
 // and pushed onto that same `occupied` list so nothing spawns inside a
 // cluster's footprint -- clusters are the first thing placed, before any
 // other entity.
-function makeRockClusters(width: number, height: number, occupied: { pos: Vec2; radius: number }[]): WallRect[] {
-  const walls: WallRect[] = [];
+function makeRockClusters(width: number, height: number, occupied: { pos: Vec2; radius: number }[]): Boulder[] {
+  const walls: Boulder[] = [];
   for (let i = 0; i < CLUSTER_COUNT; i++) {
     const span = CLUSTER_MIN_SPAN + Math.random() * (CLUSTER_MAX_SPAN - CLUSTER_MIN_SPAN);
-    const clusterRadius = span / 2;
+    const shape = pickClusterShape();
+    // A "blob" cluster's footprint is a ring of this radius, not a
+    // span/2-wide bar -- estimate its bounding radius accordingly so
+    // placeAvoiding doesn't badly under- or overestimate how much room to
+    // leave around it.
+    const clusterRadius = shape === "blob" ? span / (2 * Math.PI) + CLUSTER_BOULDER_RADIUS_MAX : span / 2;
     const pos = placeAvoiding(width, height, clusterRadius, occupied, 40, 80);
     occupied.push({ pos, radius: clusterRadius });
-    walls.push(...makeCluster(pos.x, pos.y, span, i));
+    walls.push(...makeCluster(pos.x, pos.y, span, i, shape));
   }
   return walls;
 }
@@ -283,6 +418,32 @@ function tierBands(tierIndex: number, height: number, dangerBands: [number, numb
 
 function outerBands(height: number, dangerBands: [number, number]): YRange[] {
   return tierBands(1, height, dangerBands);
+}
+
+// Builds one predator in a random outer band, placed via the same
+// placeAvoiding used for hazards/food/grass. `walls` is only needed for a
+// mid-round spawn (createInitialState already folds cluster footprints into
+// `occupied` before this runs).
+function makePredator(
+  width: number,
+  height: number,
+  dangerBands: [number, number],
+  occupied: { pos: Vec2; radius: number }[],
+  walls: Boulder[] = [],
+): Predator {
+  const bands = outerBands(height, dangerBands);
+  const homeBand = bands[Math.floor(Math.random() * bands.length)];
+  const pos = placeAvoiding(width, height, PREDATOR_RADIUS, occupied, 40, 80, homeBand, walls);
+  occupied.push({ pos, radius: PREDATOR_RADIUS });
+  return {
+    pos,
+    radius: PREDATOR_RADIUS,
+    state: "patrol",
+    patrolTarget: randomPoint(width, height, PREDATOR_RADIUS + 10, homeBand),
+    lastKnownPlayerPos: { ...pos },
+    searchTimeLeft: 0,
+    homeBand,
+  };
 }
 
 export function createInitialState(width: number, height: number): GameState {
@@ -315,20 +476,9 @@ export function createInitialState(width: number, height: number): GameState {
   }
 
   // The predator takes over tier 2's old role -- biggest, deadliest, and
-  // confined to a random outer band so it's never right on top of spawn.
-  const bands = outerBands(height, dangerBands);
-  const homeBand = bands[Math.floor(Math.random() * bands.length)];
-  const predatorPos = placeAvoiding(width, height, PREDATOR_RADIUS, occupied, 40, 80, homeBand);
-  occupied.push({ pos: predatorPos, radius: PREDATOR_RADIUS });
-  const predator: Predator = {
-    pos: predatorPos,
-    radius: PREDATOR_RADIUS,
-    state: "patrol",
-    patrolTarget: randomPoint(width, height, PREDATOR_RADIUS + 10, homeBand),
-    lastKnownPlayerPos: { ...predatorPos },
-    searchTimeLeft: 0,
-    homeBand,
-  };
+  // confined to a random outer band so it's never right on top of spawn. A
+  // second one joins mid-round -- see trySpawnSecondPredator.
+  const predators = [makePredator(width, height, dangerBands, occupied)];
 
   const grass: Grass[] = [];
   for (let i = 0; i < GRASS_COUNT; i++) {
@@ -344,7 +494,8 @@ export function createInitialState(width: number, height: number): GameState {
     hazards,
     walls,
     dangerBands,
-    predator,
+    predators,
+    secondPredatorSpawned: false,
     grass,
     powerUps: [],
     invincibleTimeLeft: 0,
@@ -356,35 +507,42 @@ export function createInitialState(width: number, height: number): GameState {
   };
 }
 
+/**
+ * The safe zone's radius around the map center at a given elapsed time --
+ * covers the whole map (a no-op) until SAFE_ZONE_SHRINK_START_S, then
+ * linearly closes in to SAFE_ZONE_MIN_FRACTION of that by SAFE_ZONE_SHRINK_END_S.
+ */
+export function safeZoneRadius(width: number, height: number, elapsedS: number): number {
+  const full = Math.hypot(width, height) / 2;
+  const span = SAFE_ZONE_SHRINK_END_S - SAFE_ZONE_SHRINK_START_S;
+  const t = Math.max(0, Math.min(1, (elapsedS - SAFE_ZONE_SHRINK_START_S) / span));
+  return full * (1 - t * (1 - SAFE_ZONE_MIN_FRACTION));
+}
+
+/** Whether the player currently sits outside the shrinking safe zone -- drives both the stepGame drain and the render.ts warning tint. */
+export function isOutsideSafeZone(state: GameState): boolean {
+  const center = { x: state.width / 2, y: state.height / 2 };
+  const radius = safeZoneRadius(state.width, state.height, TIME_LIMIT_S - state.timeLeft);
+  return dist(state.player.pos, center) > radius;
+}
+
 /** The one rule under a focused automated test: does growing into a hazard crush it, or does it kill you? */
 export function resolveHazardCollision(player: Player, hazard: Hazard): "crush" | "die" | "none" {
   if (dist(player.pos, hazard.pos) >= player.radius + hazard.radius) return "none";
   return player.radius >= hazard.radius * CRUSH_RATIO ? "crush" : "die";
 }
 
-/** Pushes a circle out of a solid rect if it overlaps; returns the same position untouched otherwise. */
-export function resolveWallCollision(pos: Vec2, radius: number, wall: WallRect): Vec2 {
-  const closestX = Math.max(wall.x, Math.min(pos.x, wall.x + wall.w));
-  const closestY = Math.max(wall.y, Math.min(pos.y, wall.y + wall.h));
-  const dx = pos.x - closestX;
-  const dy = pos.y - closestY;
+/** Pushes a circle out of a solid boulder if it overlaps; returns the same position untouched otherwise. */
+export function resolveWallCollision(pos: Vec2, radius: number, wall: Boulder): Vec2 {
+  const dx = pos.x - wall.pos.x;
+  const dy = pos.y - wall.pos.y;
   const distance = Math.hypot(dx, dy);
+  const minDist = radius + wall.radius;
 
-  if (distance === 0) {
-    const pushLeft = pos.x - wall.x;
-    const pushRight = wall.x + wall.w - pos.x;
-    const pushUp = pos.y - wall.y;
-    const pushDown = wall.y + wall.h - pos.y;
-    const min = Math.min(pushLeft, pushRight, pushUp, pushDown);
-    if (min === pushLeft) return { x: wall.x - radius, y: pos.y };
-    if (min === pushRight) return { x: wall.x + wall.w + radius, y: pos.y };
-    if (min === pushUp) return { x: pos.x, y: wall.y - radius };
-    return { x: pos.x, y: wall.y + wall.h + radius };
-  }
+  if (distance === 0) return { x: pos.x + minDist, y: pos.y };
+  if (distance >= minDist) return pos;
 
-  if (distance >= radius) return pos;
-
-  const push = (radius - distance) / distance;
+  const push = (minDist - distance) / distance;
   return { x: pos.x + dx * push, y: pos.y + dy * push };
 }
 
@@ -432,10 +590,26 @@ function consumeFood(state: GameState): void {
   }
 }
 
-function updatePredator(state: GameState, dt: number): void {
-  const p = state.predator;
-  if (!p) return;
+// Adds a second predator once the round has run for SECOND_PREDATOR_SPAWN_S
+// seconds -- placed with the same avoidance logic as init, but built fresh
+// each time since there's no running `occupied` list mid-round the way
+// createInitialState has one.
+function trySpawnSecondPredator(state: GameState): void {
+  if (state.secondPredatorSpawned) return;
+  if (TIME_LIMIT_S - state.timeLeft < SECOND_PREDATOR_SPAWN_S) return;
+  state.secondPredatorSpawned = true;
+  const occupied = [
+    { pos: state.player.pos, radius: state.player.radius + 60 },
+    ...state.predators.map((p) => ({ pos: p.pos, radius: p.radius })),
+  ];
+  state.predators.push(makePredator(state.width, state.height, state.dangerBands, occupied, state.walls));
+}
 
+function updatePredators(state: GameState, dt: number): void {
+  for (const p of state.predators) updateOnePredator(state, p, dt);
+}
+
+function updateOnePredator(state: GameState, p: Predator, dt: number): void {
   const hidden = isPlayerHidden(state);
   const distToPlayer = dist(p.pos, state.player.pos);
   const wasChasing = p.state === "chase";
@@ -527,7 +701,8 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
     state.player.pos = resolveWallCollision(state.player.pos, state.player.radius, wall);
   }
 
-  updatePredator(state, dt);
+  trySpawnSecondPredator(state);
+  updatePredators(state, dt);
   applyMagnet(state, dt);
   consumeFood(state);
   stepPowerUps(state, dt);
@@ -543,16 +718,30 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
   }
   state.hazards = survivors;
 
-  if (state.predator) {
+  const survivingPredators: Predator[] = [];
+  for (const predator of state.predators) {
     const verdict = withInvincibility(
-      resolveHazardCollision(state.player, { ...state.predator, tier: 2 }),
+      resolveHazardCollision(state.player, { ...predator, tier: 2 }),
       state.invincibleTimeLeft,
     );
     if (verdict === "die") {
       state.status = "lost";
       return state;
     }
-    if (verdict === "crush") state.predator = null;
+    if (verdict !== "crush") survivingPredators.push(predator);
+  }
+  state.predators = survivingPredators;
+
+  // The shrinking safe zone punishes camping far from center in the back
+  // half of a round -- unlike hazards/predators, invincibility doesn't guard
+  // against it, since the shield's role is "can't be eaten," not "immune to
+  // the terrain."
+  if (isOutsideSafeZone(state)) {
+    state.player.radius -= SAFE_ZONE_DRAIN_PER_S * dt;
+    if (state.player.radius < MIN_SURVIVABLE_RADIUS) {
+      state.status = "lost";
+      return state;
+    }
   }
 
   state.timeLeft -= dt;
