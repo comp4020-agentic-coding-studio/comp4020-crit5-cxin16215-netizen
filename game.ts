@@ -130,7 +130,34 @@ export const CRUSH_RATIO = 1.3;
 export const FOOD_RADIUS = 4;
 export const FOOD_GROWTH = 1.3;
 export const FOOD_COUNT = 30;
-export const FOLLOW_EASE = 7;
+// Exponential follow: the player covers `1 - e^(-EASE * dt)` of the gap to
+// the pointer each step, so the feel is set by the time constant 1/EASE. At
+// the old 7 that was ~143ms of lag between hand and blob -- smooth, but
+// slurred, and the main reason movement read as heavy rather than silky. 11
+// puts it near 90ms: still enough trail to feel like a creature with mass
+// (an instant snap would lose that entirely), but tight enough that a dodge
+// lands when you make it. This is the dial to turn for control feel.
+export const FOLLOW_EASE = 11;
+
+// How far the follow target may ever sit ahead of the player.
+//
+// Without this the target is a bucket that fills faster than the player can
+// empty it. Movement is applied by easing toward the target, but the player is
+// afterwards clamped to the canvas and pushed back out of any boulder it
+// overlaps -- while the target, which is just accumulated mouse travel, keeps
+// going. Shove into a rock and every frame adds more distance the player is
+// physically unable to spend, so the gap grows without bound. Slide off the
+// rock and the ease suddenly sees that whole banked gap at once: since a step
+// is proportional to the gap, the blob rockets across the screen. That is the
+// "lags behind, then snaps over" feel exactly, and fast flicks cause a milder
+// version of the same thing.
+//
+// Leashing the target bounds the gap, which bounds the catch-up step, which
+// makes the top speed constant instead of "however much you banked". At this
+// distance the leash only engages past ~1000px/s of pointer travel or when
+// something is physically blocking you -- normal steering never reaches it,
+// so this costs nothing in ordinary play and only removes the lurch.
+export const MAX_TARGET_LEAD = 110;
 export const GATE_GAP = 80;
 export const HAZARDS_PER_TIER = 4;
 
@@ -696,6 +723,20 @@ export function chaseThreatDistance(state: GameState): number {
   return Math.max(0, nearest);
 }
 
+/**
+ * Pulls `target` back onto a circle of radius `maxLead` around `from` when it
+ * has drifted further than that, leaving it untouched otherwise. Direction is
+ * preserved, so steering is unaffected -- only the banked distance is dropped.
+ */
+export function clampToLead(target: Vec2, from: Vec2, maxLead: number): Vec2 {
+  const dx = target.x - from.x;
+  const dy = target.y - from.y;
+  const distance = Math.hypot(dx, dy);
+  if (distance <= maxLead || distance === 0) return { x: target.x, y: target.y };
+  const scale = maxLead / distance;
+  return { x: from.x + dx * scale, y: from.y + dy * scale };
+}
+
 /** The one rule under a focused automated test: does growing into a hazard crush it, or does it kill you? */
 export function resolveHazardCollision(player: Player, hazard: Hazard): "crush" | "die" | "none" {
   if (dist(player.pos, hazard.pos) >= player.radius + hazard.radius) return "none";
@@ -914,6 +955,13 @@ export function stepGame(state: GameState, dt: number, target: Vec2): GameState 
     state.comboTimeLeft = Math.max(0, state.comboTimeLeft - dt);
     if (state.comboTimeLeft === 0) state.combo = 0;
   }
+
+  // Written back into the caller's target on purpose: the banked distance has
+  // to be discarded, not just ignored for one frame, or it would still be
+  // sitting there waiting to snap the moment the player comes unblocked.
+  const leashed = clampToLead(target, state.player.pos, MAX_TARGET_LEAD);
+  target.x = leashed.x;
+  target.y = leashed.y;
 
   const ease = 1 - Math.exp(-FOLLOW_EASE * dt);
   state.player.pos.x += (target.x - state.player.pos.x) * ease;
