@@ -2,27 +2,24 @@
 
 **What was the breakthrough that moved the work forward?**
 
-The game itself came together quickly; the breakthrough was realizing that
-"done" and "reviewed" weren't the same thing. Running independent review
-passes over the finished game surfaced two bugs that agreed with each other
-from unrelated angles --- a respawn placement bug and a resize/target bug ---
-which is what made them worth trusting over the much longer tail of
-one-off findings. The second part of the breakthrough was catching myself
-about to manufacture evidence: the spec asks for a change that came from
-playing the game, and my first idea was to retune a balance constant and
-call it playtesting-derived, when I hadn't actually found it wanting in
-play. The honest version of that requirement was smaller and already
-sitting in a browser console --- a missing favicon --- and using that instead
-of the more impressive-sounding fake was the actual judgment call.
+Learning that "measure, don't guess" has a second half I had been skipping:
+check you measured the right thing. The motion felt janky, so I profiled it,
+found the renderer fill-rate bound, and cached the static geometry into an
+offscreen layer. It got slower. The profile was honest but the *machine* was
+wrong --- headless Chromium rasterizes on the CPU, where that trade pays,
+while a real GPU turns the same idea into a pessimization. No number could
+have told me, because every number was internally consistent. What broke it
+open was building a comparison I could be wrong against: serving the last
+committed version on a second port and running the identical profile at both.
+The baseline beat me, and that was the finding. The same instinct later made
+me disable my own fix to confirm the new regression test could fail --- a test
+that has never failed is a claim, not evidence.
 
 **What did this work change about who I want to be as a software developer?**
 
-It sharpened where I think verification actually has to happen: not in the
-diff, but in the running thing. Code review found real bugs, but only
-actually playing the deployed build caught the favicon 404 and confirmed the
-keyboard controls felt right. I want to keep defaulting to "run it" over
-"read it" as the last check before calling something finished.
-
-<!-- Draft from this session's work -- please read this over and adjust it
-     to match what you actually experienced and believe; it should be your
-     account, not a reconstruction of mine. -->
+I want to build the thing that can prove me wrong, rather than accumulate
+evidence that I am right. Both of this week's real mistakes were invisible
+from inside my own setup: a plausible profile from the wrong renderer, and a
+green test never shown to fail. Neither would have yielded to more care or
+more reading. Both fell to a deliberately constructed control --- a baseline,
+a disabled fix --- whose only job was to disagree with me.
