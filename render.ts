@@ -215,6 +215,7 @@ export function render(
   ctx.fillRect(0, 0, width, height);
 
   const pulse = 1 + Math.sin(clockSeconds * 6) * 0.06;
+  const scale = ctx.getTransform().a || 1;
 
   // Only the world shakes. Letting the HUD ride along would make the score
   // and timer unreadable at exactly the moments they matter most.
@@ -225,7 +226,7 @@ export function render(
 
   drawSafeZone(ctx, state, clockSeconds);
   drawGrass(ctx, state, clockSeconds);
-  drawWalls(ctx, state, clockSeconds);
+  drawWalls(ctx, state, clockSeconds, scale);
   drawFood(ctx, state);
   drawPowerUps(ctx, state, clockSeconds);
 
@@ -502,15 +503,39 @@ function drawGapVines(
   ctx.lineCap = "butt";
 }
 
-// Deliberately NOT cached into an offscreen layer, despite the boulders being
-// static for the whole round. That was tried and measured worse: ~105
-// boulders of radius 9-15 cover roughly 100k device pixels between them,
-// while blitting a prebaked full-canvas layer costs a 4.7M-pixel alpha
-// composite -- about 44x more pixels than the thing it was avoiding. Caching
-// static geometry only pays when the geometry covers most of the screen.
-function drawWalls(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number): void {
+// Boulders never move for the life of a round, yet redrawing them meant ~105
+// fresh radial gradients and 105 jagged paths rasterized every single frame
+// for an image that never changed. They are baked into an offscreen layer
+// once and blitted instead, which turns the most expensive static geometry in
+// the scene into one drawImage. Rebuilt only when the round changes (a new
+// `walls` array) or the canvas is resized.
+let boulderLayer: HTMLCanvasElement | null = null;
+let boulderLayerWalls: GameState["walls"] | null = null;
+let boulderLayerScale = 0;
+let boulderLayerW = -1;
+let boulderLayerH = -1;
+
+function getBoulderLayer(state: GameState, scale: number): HTMLCanvasElement | null {
+  if (
+    boulderLayer &&
+    boulderLayerWalls === state.walls &&
+    boulderLayerScale === scale &&
+    boulderLayerW === state.width &&
+    boulderLayerH === state.height
+  ) {
+    return boulderLayer;
+  }
+
+  const layer = boulderLayer ?? document.createElement("canvas");
+  layer.width = Math.max(1, Math.round(state.width * scale));
+  layer.height = Math.max(1, Math.round(state.height * scale));
+  const lctx = layer.getContext("2d");
+  if (!lctx) return null;
+  lctx.setTransform(scale, 0, 0, scale, 0, 0);
+  lctx.clearRect(0, 0, state.width, state.height);
+
   for (const wall of state.walls) {
-    const g = ctx.createRadialGradient(
+    const g = lctx.createRadialGradient(
       wall.pos.x - wall.radius * 0.3,
       wall.pos.y - wall.radius * 0.3,
       0,
@@ -520,14 +545,26 @@ function drawWalls(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds
     );
     g.addColorStop(0, "#5c6e46");
     g.addColorStop(1, "#12180d");
-    ctx.fillStyle = g;
-    boulderRockPath(ctx, wall);
-    ctx.fill();
+    lctx.fillStyle = g;
+    boulderRockPath(lctx, wall);
+    lctx.fill();
 
-    ctx.strokeStyle = "rgba(170,200,120,0.4)";
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    lctx.strokeStyle = "rgba(170,200,120,0.4)";
+    lctx.lineWidth = 2;
+    lctx.stroke();
   }
+
+  boulderLayer = layer;
+  boulderLayerWalls = state.walls;
+  boulderLayerScale = scale;
+  boulderLayerW = state.width;
+  boulderLayerH = state.height;
+  return layer;
+}
+
+function drawWalls(ctx: CanvasRenderingContext2D, state: GameState, clockSeconds: number, scale: number): void {
+  const layer = getBoulderLayer(state, scale);
+  if (layer) ctx.drawImage(layer, 0, 0, state.width, state.height);
 
   // Mark every real gap in each cluster with a tangle of vines -- derived
   // straight from the boulders' own positions, no extra state -- so each
